@@ -461,13 +461,9 @@ void stopServoMotion(int servoNum) {
 
   servo.active = false;
   servo.starting = false;
-  servo.responding = false;
-  servo.hasResponse = false;
-  servo.linkHealthy = false;
   servo.stepIndex = 0;
   servo.pauseActive = false;
   servo.pauseStartedAt = 0;
-  servo.lastResponseAt = 0;
   servo.probeStartedAt = 0;
   servo.commandedPos = servo.currentPos;
   markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
