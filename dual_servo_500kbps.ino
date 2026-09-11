@@ -487,7 +487,7 @@ void serviceServoMotion(int servoNum) {
   unsigned long now = millis();
 
   if (servo.starting) {
-    if (servo.responding) {
+    if (servo.hasResponse) {
       servo.starting = false;
       servo.active = true;
       servo.lastStepAt = 0;
