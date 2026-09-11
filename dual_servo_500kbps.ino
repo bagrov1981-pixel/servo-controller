@@ -582,7 +582,7 @@ void drawLogs() {
     snprintf(buffer, sizeof(buffer), "N%03lX P:%lu T:%lu",
              canLogs[idx].id,
              (unsigned long)pos,
-             canLogs[idx].timestamp);
+             (unsigned long)canLogs[idx].timestamp);
 
     tft.setCursor(6, LOG_Y + (line * 12));
     tft.print(buffer);
@@ -750,7 +750,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         .servo-panel { display: inline-block; width: 48%; margin-right: 2%; vertical-align: top; }
         button { width: 100%; padding: 12px; background: #00d2ff; border: none; color: #000; font-weight: bold; border-radius: 4px; cursor: pointer; margin: 5px 0; }
         button.red { background: #ff4444; }
-        #log { background: #111; color: #0f0; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+        #log { background: #111; color: #0f0; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
     </style>
 </head>
 <body>
@@ -799,7 +799,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 document.getElementById('lag2').textContent = d.s2_lag;
             });
             fetch('/logs').then(r => r.text()).then(d => {
-                document.getElementById('log').innerHTML = d.trim() ? d : 'Waiting...';
+                document.getElementById('log').textContent = d.trim() ? d : 'Waiting...';
                 document.getElementById('log').scrollTop = 9999;
             });
         }, 500);
@@ -856,9 +856,9 @@ void setupWebServer() {
       html += String(pos);
       html += " T:";
       html += String(canLogs[i].timestamp);
-      html += "<br>";
+      html += "\n";
     }
-    server.send(200, "text/html", html);
+    server.send(200, "text/plain", html);
   });
 
   server.begin();
