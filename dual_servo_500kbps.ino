@@ -81,6 +81,7 @@ struct ServoState {
   uint32_t currentPos;
   uint32_t commandedPos;
   bool active;
+  bool starting;
   bool responding;
   int responseCount;
   bool directionForward;
@@ -88,6 +89,7 @@ struct ServoState {
   unsigned long lastStepAt;
   unsigned long pauseUntil;
   unsigned long lastResponseAt;
+  unsigned long probeStartedAt;
 };
 
 struct DisplayCache {
@@ -98,9 +100,12 @@ struct DisplayCache {
   int32_t selectedLag;
   int selectedServo;
   bool selectedActive;
+  bool selectedStarting;
   bool selectedResponding;
   bool s1Active;
   bool s2Active;
+  bool s1Starting;
+  bool s2Starting;
   bool s1Responding;
   bool s2Responding;
   uint32_t canLogVersion;
@@ -120,8 +125,8 @@ CANMessage canLogs[MAX_CAN_LOGS];
 int logCount = 0;
 uint32_t canLogVersion = 0;
 
-ServoState servo1 = {CENTER_POS, CENTER_POS, false, false, 0, true, 0, 0, 0, 0};
-ServoState servo2 = {CENTER_POS, CENTER_POS, false, false, 0, true, 0, 0, 0, 0};
+ServoState servo1 = {CENTER_POS, CENTER_POS, false, false, false, 0, true, 0, 0, 0, 0, 0};
+ServoState servo2 = {CENTER_POS, CENTER_POS, false, false, false, 0, true, 0, 0, 0, 0, 0};
 int selectedServo = 1;
 
 unsigned long lastTftUpdate = 0;
@@ -140,6 +145,9 @@ DisplayCache displayCache = {
   0xFFFFFFFFUL,
   0x7FFFFFFF,
   -1,
+  false,
+  false,
+  false,
   false,
   false,
   false,
@@ -173,8 +181,14 @@ ServoState& getServoByNumber(int servoNum) {
   return (servoNum == 1) ? servo1 : servo2;
 }
 
-ServoState& getServoByNodeId(uint32_t nodeId) {
-  return (nodeId == NODE_ID_SERVO1) ? servo1 : servo2;
+ServoState* findServoByNodeId(uint32_t nodeId) {
+  if (nodeId == NODE_ID_SERVO1) {
+    return &servo1;
+  }
+  if (nodeId == NODE_ID_SERVO2) {
+    return &servo2;
+  }
+  return nullptr;
 }
 
 uint32_t getServoNodeId(int servoNum) {
@@ -217,7 +231,7 @@ void clearLogs() {
 }
 
 bool isInsideRect(int x, int y, int rx, int ry, int rw, int rh) {
-  return x >= rx && x <= (rx + rw) && y >= ry && y <= (ry + rh);
+  return x >= rx && x < (rx + rw) && y >= ry && y < (ry + rh);
 }
 
 int32_t servoLag(const ServoState& servo) {
@@ -279,11 +293,15 @@ void sendCANFrame(uint32_t position, uint32_t nodeId) {
 }
 
 void applyServoResponse(const twai_message_t& rx) {
-  ServoState& servo = getServoByNodeId(rx.identifier);
-  servo.currentPos = parsePos(rx.data);
-  servo.responding = true;
-  servo.responseCount++;
-  servo.lastResponseAt = millis();
+  ServoState* servo = findServoByNodeId(rx.identifier);
+  if (servo == nullptr) {
+    return;
+  }
+
+  servo->currentPos = parsePos(rx.data);
+  servo->responding = true;
+  servo->responseCount++;
+  servo->lastResponseAt = millis();
 
   appendCANLog(rx.identifier, rx.data_length_code, rx.data);
   printCAN("RX", rx.identifier, rx);
@@ -301,48 +319,32 @@ void processCANReceive(TickType_t waitTicks = 0) {
   }
 }
 
-bool testServoResponse(uint32_t nodeId) {
-  ServoState& servo = getServoByNodeId(nodeId);
-  int servoNum = (nodeId == NODE_ID_SERVO1) ? 1 : 2;
+void beginServoStartProbe(int servoNum) {
+  ServoState& servo = getServoByNumber(servoNum);
 
   Serial.print("\n========== SERVO ");
   Serial.print(servoNum);
   Serial.println(" TEST ==========");
 
+  servo.active = false;
+  servo.starting = true;
   servo.responding = false;
   servo.responseCount = 0;
   servo.lastResponseAt = 0;
-  markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+  servo.probeStartedAt = millis();
+  servo.commandedPos = CENTER_POS;
 
   Serial.print("[TEST] Sending CENTER position to Servo ");
   Serial.println(servoNum);
-  sendCANFrame(CENTER_POS, nodeId);
-
-  unsigned long startTime = millis();
-  while (millis() - startTime < RESPONSE_TIMEOUT * 4) {
-    processCANReceive(pdMS_TO_TICKS(5));
-    server.handleClient();
-    if (servo.responding) {
-      Serial.print("[OK] Servo ");
-      Serial.print(servoNum);
-      Serial.print(" is responding! (");
-      Serial.print(servo.responseCount);
-      Serial.println(" responses)");
-      return true;
-    }
-  }
-
-  Serial.print("[ERROR] NO RESPONSE from Servo ");
-  Serial.println(servoNum);
-  return false;
+  sendCANFrame(CENTER_POS, getServoNodeId(servoNum));
+  markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS | DIRTY_SUMMARY);
 }
 
 // ========== MOTION CONTROL ==========
 void startServoMotion(int servoNum) {
   ServoState& servo = getServoByNumber(servoNum);
-  uint32_t nodeId = getServoNodeId(servoNum);
 
-  if (servo.active) {
+  if (servo.active || servo.starting) {
     return;
   }
 
@@ -353,21 +355,16 @@ void startServoMotion(int servoNum) {
   servo.stepIndex = 0;
   servo.lastStepAt = 0;
   servo.pauseUntil = 0;
+  servo.probeStartedAt = 0;
   servo.commandedPos = CENTER_POS;
   markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS | DIRTY_SUMMARY);
 
-  if (testServoResponse(nodeId)) {
-    servo.active = true;
-    markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
-  } else {
-    servo.active = false;
-    markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
-  }
+  beginServoStartProbe(servoNum);
 }
 
 void stopServoMotion(int servoNum) {
   ServoState& servo = getServoByNumber(servoNum);
-  if (!servo.active) {
+  if (!servo.active && !servo.starting) {
     return;
   }
 
@@ -375,13 +372,16 @@ void stopServoMotion(int servoNum) {
   Serial.println(servoNum);
 
   servo.active = false;
+  servo.starting = false;
   servo.stepIndex = 0;
   servo.pauseUntil = 0;
+  servo.probeStartedAt = 0;
   markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
 }
 
 void toggleServoMotion(int servoNum) {
-  if (getServoByNumber(servoNum).active) {
+  ServoState& servo = getServoByNumber(servoNum);
+  if (servo.active || servo.starting) {
     stopServoMotion(servoNum);
   } else {
     startServoMotion(servoNum);
@@ -390,11 +390,34 @@ void toggleServoMotion(int servoNum) {
 
 void serviceServoMotion(int servoNum) {
   ServoState& servo = getServoByNumber(servoNum);
+  unsigned long now = millis();
+
+  if (servo.starting) {
+    if (servo.responding) {
+      servo.starting = false;
+      servo.active = true;
+      servo.lastStepAt = 0;
+      servo.pauseUntil = 0;
+      Serial.print("[OK] Servo ");
+      Serial.print(servoNum);
+      Serial.print(" is responding! (");
+      Serial.print(servo.responseCount);
+      Serial.println(" responses)");
+      markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+    } else if ((now - servo.probeStartedAt) >= RESPONSE_TIMEOUT * 4) {
+      servo.starting = false;
+      servo.active = false;
+      Serial.print("[ERROR] NO RESPONSE from Servo ");
+      Serial.println(servoNum);
+      markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+    }
+    return;
+  }
+
   if (!servo.active) {
     return;
   }
 
-  unsigned long now = millis();
   if (servo.pauseUntil != 0 && now < servo.pauseUntil) {
     return;
   }
@@ -501,7 +524,7 @@ void drawServoButton(int servoNum, int x, int y, int w, int h) {
 
   tft.setTextSize(1);
   tft.setCursor(x + 10, y + 54);
-  tft.print(servo.active ? "RUN" : "IDLE");
+  tft.print(servo.starting ? "PING" : (servo.active ? "RUN" : "IDLE"));
   tft.setCursor(x + w - 42, y + 54);
   tft.print(servo.responding ? "OK" : "WAIT");
 }
@@ -522,7 +545,7 @@ void drawSelectedServoPanel() {
   tft.setCursor(6, INFO_Y + 4);
   tft.print("S");
   tft.print(selectedServo);
-  tft.print(servo.active ? " RUN" : " IDLE");
+  tft.print(servo.starting ? " PING" : (servo.active ? " RUN" : " IDLE"));
 
   tft.setTextSize(1);
   tft.setTextColor(servo.responding ? ST77XX_GREEN : ST77XX_RED);
@@ -579,6 +602,7 @@ void refreshDisplayDirtyFlags() {
       selected.commandedPos != displayCache.selectedCommanded ||
       lag != displayCache.selectedLag ||
       selected.active != displayCache.selectedActive ||
+      selected.starting != displayCache.selectedStarting ||
       selected.responding != displayCache.selectedResponding) {
     markDisplayDirty(DIRTY_SELECTED);
   }
@@ -586,6 +610,8 @@ void refreshDisplayDirtyFlags() {
   if (selectedServo != displayCache.selectedServo ||
       servo1.active != displayCache.s1Active ||
       servo2.active != displayCache.s2Active ||
+      servo1.starting != displayCache.s1Starting ||
+      servo2.starting != displayCache.s2Starting ||
       servo1.responding != displayCache.s1Responding ||
       servo2.responding != displayCache.s2Responding) {
     markDisplayDirty(DIRTY_BUTTONS);
@@ -605,9 +631,12 @@ void updateDisplayCache() {
   displayCache.selectedLag = servoLag(selected);
   displayCache.selectedServo = selectedServo;
   displayCache.selectedActive = selected.active;
+  displayCache.selectedStarting = selected.starting;
   displayCache.selectedResponding = selected.responding;
   displayCache.s1Active = servo1.active;
   displayCache.s2Active = servo2.active;
+  displayCache.s1Starting = servo1.starting;
+  displayCache.s2Starting = servo2.starting;
   displayCache.s1Responding = servo1.responding;
   displayCache.s2Responding = servo2.responding;
   displayCache.canLogVersion = canLogVersion;
