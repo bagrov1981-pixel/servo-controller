@@ -18,7 +18,7 @@
 #define SPI_MOSI   13
 #define CAN_TX_PIN 5
 #define CAN_RX_PIN 4
-#define START_BUTTON_PIN 0
+#define START_BUTTON_PIN 15
 
 // ========== DISPLAY LAYOUT ==========
 #define SCREEN_W 320
