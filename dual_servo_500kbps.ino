@@ -124,6 +124,7 @@ enum DisplayDirtyFlags : uint8_t {
 
 CANMessage canLogs[MAX_CAN_LOGS];
 int logCount = 0;
+int logStart = 0;
 uint32_t canLogVersion = 0;
 
 ServoState servo1 = {CENTER_POS, CENTER_POS, false, false, false, 0, true, 0, 0, 0, 0, 0};
@@ -205,15 +206,20 @@ void markDisplayDirty(uint8_t flags = DIRTY_ALL) {
   displayDirtyFlags |= flags;
 }
 
+const CANMessage& getCANLogAt(int index) {
+  return canLogs[(logStart + index) % MAX_CAN_LOGS];
+}
+
 void appendCANLog(uint32_t id, uint8_t dlc, const uint8_t* data) {
+  int writeIndex = (logStart + logCount) % MAX_CAN_LOGS;
   if (logCount >= MAX_CAN_LOGS) {
-    for (int i = 1; i < MAX_CAN_LOGS; i++) {
-      canLogs[i - 1] = canLogs[i];
-    }
-    logCount = MAX_CAN_LOGS - 1;
+    writeIndex = logStart;
+    logStart = (logStart + 1) % MAX_CAN_LOGS;
+  } else {
+    logCount++;
   }
 
-  CANMessage& msg = canLogs[logCount++];
+  CANMessage& msg = canLogs[writeIndex];
   msg.id = id;
   msg.dlc = dlc;
   msg.timestamp = millis();
@@ -227,6 +233,7 @@ void appendCANLog(uint32_t id, uint8_t dlc, const uint8_t* data) {
 
 void clearLogs() {
   logCount = 0;
+  logStart = 0;
   canLogVersion++;
   markDisplayDirty(DIRTY_LOGS);
 }
@@ -441,7 +448,7 @@ void serviceServoMotion(int servoNum) {
   markDisplayDirty(DIRTY_SUMMARY | DIRTY_SELECTED);
 
   if (servo.stepIndex >= TOTAL_STEPS) {
-    servo.stepIndex = 0;
+    servo.stepIndex = 1;
     servo.directionForward = !servo.directionForward;
     servo.pauseUntil = now + MOTION_PAUSE_MS;
 
@@ -578,12 +585,13 @@ void drawLogs() {
       continue;
     }
 
-    uint32_t pos = parsePos(canLogs[idx].data);
+    const CANMessage& logEntry = getCANLogAt(idx);
+    uint32_t pos = parsePos(logEntry.data);
     char buffer[48];
     snprintf(buffer, sizeof(buffer), "N%03lX P:%lu T:%lu",
-             (unsigned long)canLogs[idx].id,
+             (unsigned long)logEntry.id,
              (unsigned long)pos,
-             (unsigned long)canLogs[idx].timestamp);
+             (unsigned long)logEntry.timestamp);
 
     tft.setCursor(6, LOG_Y + (line * 12));
     tft.print(buffer);
@@ -850,13 +858,14 @@ void setupWebServer() {
   server.on("/logs", []() {
     String html;
     for (int i = (logCount > 30 ? logCount - 30 : 0); i < logCount; i++) {
-      uint32_t pos = parsePos(canLogs[i].data);
+      const CANMessage& logEntry = getCANLogAt(i);
+      uint32_t pos = parsePos(logEntry.data);
       html += "N";
-      html += String(canLogs[i].id, HEX);
+      html += String(logEntry.id, HEX);
       html += " Pos:";
       html += String(pos);
       html += " T:";
-      html += String(canLogs[i].timestamp);
+      html += String(logEntry.timestamp);
       html += "\n";
     }
     server.send(200, "text/plain", html);
