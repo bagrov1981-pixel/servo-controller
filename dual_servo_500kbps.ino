@@ -125,13 +125,32 @@ enum DisplayDirtyFlags : uint8_t {
   DIRTY_ALL = DIRTY_STATIC | DIRTY_SUMMARY | DIRTY_BUTTONS | DIRTY_SELECTED | DIRTY_LOGS
 };
 
+ServoState makeServoState() {
+  ServoState servo = {};
+  servo.currentPos = CENTER_POS;
+  servo.commandedPos = CENTER_POS;
+  servo.active = false;
+  servo.starting = false;
+  servo.responding = false;
+  servo.linkHealthy = false;
+  servo.responseCount = 0;
+  servo.directionForward = true;
+  servo.boundaryHoldSent = false;
+  servo.stepIndex = 0;
+  servo.lastStepAt = 0;
+  servo.pauseUntil = 0;
+  servo.lastResponseAt = 0;
+  servo.probeStartedAt = 0;
+  return servo;
+}
+
 CANMessage canLogs[MAX_CAN_LOGS];
 int logCount = 0;
 int logStart = 0;
 uint32_t canLogVersion = 0;
 
-ServoState servo1 = {CENTER_POS, CENTER_POS, false, false, false, false, 0, true, false, 0, 0, 0, 0, 0};
-ServoState servo2 = {CENTER_POS, CENTER_POS, false, false, false, false, 0, true, false, 0, 0, 0, 0, 0};
+ServoState servo1 = makeServoState();
+ServoState servo2 = makeServoState();
 int selectedServo = 1;
 
 unsigned long lastTftUpdate = 0;
