@@ -69,6 +69,7 @@ const unsigned long LINK_STALE_MS = 2500;
 const unsigned long TFT_UPDATE_INTERVAL_MS = 50;
 const int MAX_CAN_LOGS = 50;
 const int TFT_LOG_LINES = 6;
+const int START_PROBE_TOLERANCE = 50;
 const float MOTION_CURVE_PI = 3.14159265f;
 
 // ========== DATA STRUCTURES ==========
@@ -483,7 +484,8 @@ void serviceServoMotion(int servoNum) {
   unsigned long now = millis();
 
   if (servo.starting) {
-    if (servo.hasResponse) {
+    if (servo.hasResponse &&
+        abs((int32_t)servo.currentPos - (int32_t)CENTER_POS) < START_PROBE_TOLERANCE) {
       servo.starting = false;
       servo.active = true;
       servo.lastStepAt = 0;
@@ -970,6 +972,10 @@ void setupWebServer() {
   server.on("/toggle", []() {
     int servoNum = server.arg("s").toInt();
     if (servoNum == 1 || servoNum == 2) {
+      if (getServoByNumber(servoNum).starting) {
+        server.send(200, "text/plain", "STARTING");
+        return;
+      }
       toggleServoMotion(servoNum);
       server.send(200, "text/plain", "OK");
     } else {
@@ -984,6 +990,7 @@ void setupWebServer() {
 
   server.on("/logs", []() {
     String html;
+    html.reserve(logCount * 24);
     for (int i = (logCount > 30 ? logCount - 30 : 0); i < logCount; i++) {
       const CANMessage& logEntry = getCANLogAt(i);
       uint32_t pos = parsePos(logEntry.data);
