@@ -462,7 +462,10 @@ void stopServoMotion(int servoNum) {
 
   servo.active = false;
   servo.starting = false;
+  servo.directionForward = true;
+  servo.boundaryHoldSent = true;
   servo.stepIndex = 0;
+  servo.lastStepAt = 0;
   servo.pauseActive = false;
   servo.pauseStartedAt = 0;
   servo.probeStartedAt = 0;
@@ -972,6 +975,7 @@ void setupWebServer() {
   server.on("/toggle", []() {
     int servoNum = server.arg("s").toInt();
     if (servoNum == 1 || servoNum == 2) {
+      selectedServo = servoNum;
       if (getServoByNumber(servoNum).starting) {
         server.send(200, "text/plain", "STARTING");
         return;
