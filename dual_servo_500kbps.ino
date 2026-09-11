@@ -85,13 +85,15 @@ struct ServoState {
   bool active;
   bool starting;
   bool responding;
+  bool hasResponse;
   bool linkHealthy;
   int responseCount;
   bool directionForward;
   bool boundaryHoldSent;
   int stepIndex;
   unsigned long lastStepAt;
-  unsigned long pauseUntil;
+  bool pauseActive;
+  unsigned long pauseStartedAt;
   unsigned long lastResponseAt;
   unsigned long probeStartedAt;
 };
@@ -132,13 +134,15 @@ ServoState makeServoState() {
   servo.active = false;
   servo.starting = false;
   servo.responding = false;
+  servo.hasResponse = false;
   servo.linkHealthy = false;
   servo.responseCount = 0;
   servo.directionForward = true;
   servo.boundaryHoldSent = false;
   servo.stepIndex = 0;
   servo.lastStepAt = 0;
-  servo.pauseUntil = 0;
+  servo.pauseActive = false;
+  servo.pauseStartedAt = 0;
   servo.lastResponseAt = 0;
   servo.probeStartedAt = 0;
   return servo;
@@ -294,6 +298,24 @@ int32_t servoLag(const ServoState& servo) {
   return (int32_t)servo.commandedPos - (int32_t)servo.currentPos;
 }
 
+bool updateDebouncedPress(bool reading, unsigned long now, bool& lastReading, bool& stableState, unsigned long& lastChangeAt) {
+  if (reading != lastReading) {
+    lastChangeAt = now;
+    lastReading = reading;
+  }
+
+  if ((now - lastChangeAt) < START_DEBOUNCE_MS) {
+    return false;
+  }
+
+  if (reading != stableState) {
+    stableState = reading;
+    return stableState == LOW;
+  }
+
+  return false;
+}
+
 // ========== CAN INITIALIZATION ==========
 bool initCAN_500kbps() {
   Serial.println("\n[CAN] Initializing at 500kbps...");
@@ -356,6 +378,7 @@ void applyServoResponse(const twai_message_t& rx) {
 
   servo->currentPos = parsePos(rx.data);
   servo->responding = true;
+  servo->hasResponse = true;
   servo->linkHealthy = true;
   servo->responseCount++;
   servo->lastResponseAt = millis();
@@ -389,6 +412,7 @@ void beginServoStartProbe(int servoNum) {
   servo.active = false;
   servo.starting = true;
   servo.responding = false;
+  servo.hasResponse = false;
   servo.linkHealthy = false;
   servo.responseCount = 0;
   servo.boundaryHoldSent = true;
@@ -417,7 +441,8 @@ void startServoMotion(int servoNum) {
   servo.boundaryHoldSent = true;
   servo.stepIndex = 0;
   servo.lastStepAt = 0;
-  servo.pauseUntil = 0;
+  servo.pauseActive = false;
+  servo.pauseStartedAt = 0;
   servo.probeStartedAt = 0;
   servo.commandedPos = CENTER_POS;
   markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS | DIRTY_SUMMARY);
@@ -437,9 +462,11 @@ void stopServoMotion(int servoNum) {
   servo.active = false;
   servo.starting = false;
   servo.responding = false;
+  servo.hasResponse = false;
   servo.linkHealthy = false;
   servo.stepIndex = 0;
-  servo.pauseUntil = 0;
+  servo.pauseActive = false;
+  servo.pauseStartedAt = 0;
   servo.lastResponseAt = 0;
   servo.probeStartedAt = 0;
   servo.commandedPos = servo.currentPos;
@@ -464,7 +491,8 @@ void serviceServoMotion(int servoNum) {
       servo.starting = false;
       servo.active = true;
       servo.lastStepAt = 0;
-      servo.pauseUntil = 0;
+      servo.pauseActive = false;
+      servo.pauseStartedAt = 0;
       Serial.print("[OK] Servo ");
       Serial.print(servoNum);
       Serial.print(" is responding! (");
@@ -475,6 +503,7 @@ void serviceServoMotion(int servoNum) {
       servo.starting = false;
       servo.active = false;
       servo.responding = false;
+      servo.hasResponse = false;
       servo.linkHealthy = false;
       servo.lastResponseAt = 0;
       Serial.print("[ERROR] NO RESPONSE from Servo ");
@@ -488,8 +517,11 @@ void serviceServoMotion(int servoNum) {
     return;
   }
 
-  if (servo.pauseUntil != 0 && now < servo.pauseUntil) {
-    return;
+  if (servo.pauseActive) {
+    if ((now - servo.pauseStartedAt) < MOTION_PAUSE_MS) {
+      return;
+    }
+    servo.pauseActive = false;
   }
 
   if (servo.lastStepAt != 0 && (now - servo.lastStepAt) < STEP_DELAY) {
@@ -518,7 +550,8 @@ void serviceServoMotion(int servoNum) {
     servo.stepIndex = 0;
     servo.directionForward = !servo.directionForward;
     servo.boundaryHoldSent = true;
-    servo.pauseUntil = now + MOTION_PAUSE_MS;
+    servo.pauseActive = true;
+    servo.pauseStartedAt = now;
 
     Serial.print("[DONE] Servo ");
     Serial.print(servoNum);
@@ -531,8 +564,8 @@ void serviceServoMotion(int servoNum) {
 void refreshServoLinkState() {
   unsigned long now = millis();
 
-  bool servo1Healthy = servo1.lastResponseAt != 0 && (now - servo1.lastResponseAt) <= LINK_STALE_MS;
-  bool servo2Healthy = servo2.lastResponseAt != 0 && (now - servo2.lastResponseAt) <= LINK_STALE_MS;
+  bool servo1Healthy = servo1.hasResponse && (now - servo1.lastResponseAt) <= LINK_STALE_MS;
+  bool servo2Healthy = servo2.hasResponse && (now - servo2.lastResponseAt) <= LINK_STALE_MS;
 
   if (servo1.linkHealthy != servo1Healthy) {
     servo1.linkHealthy = servo1Healthy;
@@ -829,23 +862,10 @@ void handleTouch() {
 void handleStartButton() {
   bool reading = digitalRead(START_BUTTON_PIN);
   unsigned long now = millis();
-
-  if (reading != lastStartButtonReading) {
-    lastStartButtonChange = now;
-    lastStartButtonReading = reading;
-  }
-
-  if ((now - lastStartButtonChange) < START_DEBOUNCE_MS) {
-    return;
-  }
-
-  if (reading != startButtonStableState) {
-    startButtonStableState = reading;
-    if (startButtonStableState == LOW) {
-      Serial.print("[START] Toggle selected servo ");
-      Serial.println(selectedServo);
-      toggleServoMotion(selectedServo);
-    }
+  if (updateDebouncedPress(reading, now, lastStartButtonReading, startButtonStableState, lastStartButtonChange)) {
+    Serial.print("[START] Toggle selected servo ");
+    Serial.println(selectedServo);
+    toggleServoMotion(selectedServo);
   }
 }
 
