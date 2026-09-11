@@ -299,6 +299,10 @@ int32_t servoLag(const ServoState& servo) {
   return (int32_t)servo.commandedPos - (int32_t)servo.currentPos;
 }
 
+int32_t abs32(int32_t value) {
+  return value < 0 ? -value : value;
+}
+
 bool updateDebouncedPress(bool reading, unsigned long now, bool& lastReading, bool& stableState, unsigned long& lastChangeAt) {
   if (reading != lastReading) {
     lastChangeAt = now;
@@ -488,7 +492,7 @@ void serviceServoMotion(int servoNum) {
 
   if (servo.starting) {
     if (servo.hasResponse &&
-        abs((int32_t)servo.currentPos - (int32_t)CENTER_POS) < START_PROBE_TOLERANCE) {
+        abs32((int32_t)servo.currentPos - (int32_t)CENTER_POS) < START_PROBE_TOLERANCE) {
       servo.starting = false;
       servo.active = true;
       servo.lastStepAt = 0;
@@ -819,7 +823,6 @@ void updateDisplay() {
   if (flags & DIRTY_LOGS) {
     drawLogs();
   }
-  updateDisplayCache();
   updateDisplayCache();
   displayDirty = displayDirtyFlags != DIRTY_NONE;
 }
