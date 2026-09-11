@@ -801,6 +801,8 @@ void updateDisplay() {
   }
 
   uint8_t flags = displayDirtyFlags;
+  displayDirtyFlags = DIRTY_NONE;
+  displayDirty = false;
   if (flags & DIRTY_STATIC) {
     drawStaticLayout();
     flags |= DIRTY_SUMMARY | DIRTY_BUTTONS | DIRTY_SELECTED | DIRTY_LOGS;
@@ -817,10 +819,9 @@ void updateDisplay() {
   if (flags & DIRTY_LOGS) {
     drawLogs();
   }
-
   updateDisplayCache();
-  displayDirty = false;
-  displayDirtyFlags = DIRTY_NONE;
+  updateDisplayCache();
+  displayDirty = displayDirtyFlags != DIRTY_NONE;
 }
 
 // ========== TOUCHSCREEN HANDLING ==========
@@ -994,7 +995,7 @@ void setupWebServer() {
 
   server.on("/logs", []() {
     String html;
-    html.reserve(logCount * 24);
+    html.reserve(30 * 40);
     for (int i = (logCount > 30 ? logCount - 30 : 0); i < logCount; i++) {
       const CANMessage& logEntry = getCANLogAt(i);
       uint32_t pos = parsePos(logEntry.data);
