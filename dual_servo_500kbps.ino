@@ -84,8 +84,10 @@ struct ServoState {
   bool active;
   bool starting;
   bool responding;
+  bool linkHealthy;
   int responseCount;
   bool directionForward;
+  bool boundaryHoldSent;
   int stepIndex;
   unsigned long lastStepAt;
   unsigned long pauseUntil;
@@ -102,13 +104,13 @@ struct DisplayCache {
   int selectedServo;
   bool selectedActive;
   bool selectedStarting;
-  bool selectedResponding;
+  bool selectedLinkHealthy;
   bool s1Active;
   bool s2Active;
   bool s1Starting;
   bool s2Starting;
-  bool s1Responding;
-  bool s2Responding;
+  bool s1LinkHealthy;
+  bool s2LinkHealthy;
   uint32_t canLogVersion;
 };
 
@@ -127,8 +129,8 @@ int logCount = 0;
 int logStart = 0;
 uint32_t canLogVersion = 0;
 
-ServoState servo1 = {CENTER_POS, CENTER_POS, false, false, false, 0, true, 0, 0, 0, 0, 0};
-ServoState servo2 = {CENTER_POS, CENTER_POS, false, false, false, 0, true, 0, 0, 0, 0, 0};
+ServoState servo1 = {CENTER_POS, CENTER_POS, false, false, false, false, 0, true, false, 0, 0, 0, 0, 0};
+ServoState servo2 = {CENTER_POS, CENTER_POS, false, false, false, false, 0, true, false, 0, 0, 0, 0, 0};
 int selectedServo = 1;
 
 unsigned long lastTftUpdate = 0;
@@ -158,6 +160,15 @@ DisplayCache displayCache = {
   false,
   0xFFFFFFFFUL
 };
+
+int displayedLogIndices[TFT_LOG_LINES] = {-1, -1, -1, -1, -1, -1};
+unsigned long displayedLogIds[TFT_LOG_LINES] = {
+  0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+};
+unsigned long displayedLogTimestamps[TFT_LOG_LINES] = {
+  0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+};
+bool displayedLogUsed[TFT_LOG_LINES] = {false, false, false, false, false, false};
 
 // ========== UTILITY FUNCTIONS ==========
 void printCAN(const char* dir, uint32_t nodeId, const twai_message_t& msg) {
@@ -238,6 +249,15 @@ void clearLogs() {
   markDisplayDirty(DIRTY_LOGS);
 }
 
+void resetDisplayedLogsCache() {
+  for (int i = 0; i < TFT_LOG_LINES; i++) {
+    displayedLogIndices[i] = -1;
+    displayedLogIds[i] = 0xFFFFFFFFUL;
+    displayedLogTimestamps[i] = 0xFFFFFFFFUL;
+    displayedLogUsed[i] = false;
+  }
+}
+
 bool isInsideRect(int x, int y, int rx, int ry, int rw, int rh) {
   return x >= rx && x < (rx + rw) && y >= ry && y < (ry + rh);
 }
@@ -308,6 +328,7 @@ void applyServoResponse(const twai_message_t& rx) {
 
   servo->currentPos = parsePos(rx.data);
   servo->responding = true;
+  servo->linkHealthy = true;
   servo->responseCount++;
   servo->lastResponseAt = millis();
 
@@ -337,7 +358,9 @@ void beginServoStartProbe(int servoNum) {
   servo.active = false;
   servo.starting = true;
   servo.responding = false;
+  servo.linkHealthy = false;
   servo.responseCount = 0;
+  servo.boundaryHoldSent = true;
   servo.lastResponseAt = 0;
   servo.probeStartedAt = millis();
   servo.commandedPos = CENTER_POS;
@@ -360,6 +383,7 @@ void startServoMotion(int servoNum) {
   Serial.println(servoNum);
 
   servo.directionForward = true;
+  servo.boundaryHoldSent = true;
   servo.stepIndex = 0;
   servo.lastStepAt = 0;
   servo.pauseUntil = 0;
@@ -437,8 +461,13 @@ void serviceServoMotion(int servoNum) {
   uint32_t startPos = servo.directionForward ? CENTER_POS : getServoOuterPos(servoNum);
   uint32_t endPos = servo.directionForward ? getServoOuterPos(servoNum) : CENTER_POS;
   int32_t distance = (int32_t)endPos - (int32_t)startPos;
+  int stepToSend = servo.stepIndex;
+  if (servo.boundaryHoldSent && stepToSend == 0) {
+    stepToSend = 1;
+    servo.boundaryHoldSent = false;
+  }
 
-  float progress = (float)servo.stepIndex / (float)TOTAL_STEPS;
+  float progress = (float)stepToSend / (float)TOTAL_STEPS;
   float curve = (1.0f - cosf(progress * PI)) * 0.5f;
   uint32_t target = startPos + (int32_t)(distance * curve);
 
@@ -447,32 +476,33 @@ void serviceServoMotion(int servoNum) {
   sendCANFrame(target, getServoNodeId(servoNum));
   markDisplayDirty(DIRTY_SUMMARY | DIRTY_SELECTED);
 
-  if (servo.stepIndex >= TOTAL_STEPS) {
-    servo.stepIndex = 1;
+  if (stepToSend >= TOTAL_STEPS) {
+    servo.stepIndex = 0;
     servo.directionForward = !servo.directionForward;
+    servo.boundaryHoldSent = true;
     servo.pauseUntil = now + MOTION_PAUSE_MS;
 
     Serial.print("[DONE] Servo ");
     Serial.print(servoNum);
     Serial.println(" reached segment end");
   } else {
-    servo.stepIndex++;
+    servo.stepIndex = stepToSend + 1;
   }
 }
 
 void refreshServoLinkState() {
   unsigned long now = millis();
 
-  bool servo1Responding = servo1.lastResponseAt != 0 && (now - servo1.lastResponseAt) <= LINK_STALE_MS;
-  bool servo2Responding = servo2.lastResponseAt != 0 && (now - servo2.lastResponseAt) <= LINK_STALE_MS;
+  bool servo1Healthy = servo1.lastResponseAt != 0 && (now - servo1.lastResponseAt) <= LINK_STALE_MS;
+  bool servo2Healthy = servo2.lastResponseAt != 0 && (now - servo2.lastResponseAt) <= LINK_STALE_MS;
 
-  if (servo1.responding != servo1Responding) {
-    servo1.responding = servo1Responding;
+  if (servo1.linkHealthy != servo1Healthy) {
+    servo1.linkHealthy = servo1Healthy;
     markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
   }
 
-  if (servo2.responding != servo2Responding) {
-    servo2.responding = servo2Responding;
+  if (servo2.linkHealthy != servo2Healthy) {
+    servo2.linkHealthy = servo2Healthy;
     markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
   }
 }
@@ -480,6 +510,7 @@ void refreshServoLinkState() {
 // ========== TOUCHSCREEN UI ==========
 void drawStaticLayout() {
   tft.fillScreen(ST77XX_BLACK);
+  resetDisplayedLogsCache();
 
   tft.fillRect(0, 0, SCREEN_W, 22, 0x0011);
   tft.setTextSize(1);
@@ -534,7 +565,7 @@ void drawServoButton(int servoNum, int x, int y, int w, int h) {
   tft.setCursor(x + 10, y + 54);
   tft.print(servo.starting ? "PING" : (servo.active ? "RUN" : "IDLE"));
   tft.setCursor(x + w - 42, y + 54);
-  tft.print(servo.responding ? "OK" : "WAIT");
+  tft.print(servo.linkHealthy ? "OK" : "WAIT");
 }
 
 void drawServoSelectors() {
@@ -556,9 +587,9 @@ void drawSelectedServoPanel() {
   tft.print(servo.starting ? " PING" : (servo.active ? " RUN" : " IDLE"));
 
   tft.setTextSize(1);
-  tft.setTextColor(servo.responding ? ST77XX_GREEN : ST77XX_RED);
+  tft.setTextColor(servo.linkHealthy ? ST77XX_GREEN : ST77XX_RED);
   tft.setCursor(150, INFO_Y + 9);
-  tft.print(servo.responding ? "CAN OK" : "NO RESP");
+  tft.print(servo.linkHealthy ? "CAN OK" : "NO RESP");
 
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(6, INFO_Y + 26);
@@ -574,27 +605,57 @@ void drawSelectedServoPanel() {
   tft.print(lag);
 }
 
-void drawLogs() {
-  tft.fillRect(LOG_X, LOG_Y, LOG_W, LOG_H, ST77XX_BLACK);
+void drawLogLine(int line, int idx) {
+  int y = LOG_Y + (line * 12);
+  tft.fillRect(LOG_X, y, LOG_W, 11, ST77XX_BLACK);
+
+  if (idx < 0 || idx >= logCount) {
+    displayedLogIndices[line] = -1;
+    displayedLogIds[line] = 0xFFFFFFFFUL;
+    displayedLogTimestamps[line] = 0xFFFFFFFFUL;
+    displayedLogUsed[line] = false;
+    return;
+  }
+
+  const CANMessage& logEntry = getCANLogAt(idx);
+  uint32_t pos = parsePos(logEntry.data);
+  char buffer[48];
+  snprintf(buffer, sizeof(buffer), "N%03lX P:%lu T:%lu",
+           (unsigned long)logEntry.id,
+           (unsigned long)pos,
+           (unsigned long)logEntry.timestamp);
+
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(6, y);
+  tft.print(buffer);
 
+  displayedLogIndices[line] = idx;
+  displayedLogIds[line] = logEntry.id;
+  displayedLogTimestamps[line] = logEntry.timestamp;
+  displayedLogUsed[line] = true;
+}
+
+void drawLogs() {
+  int visibleStart = (logCount > TFT_LOG_LINES) ? (logCount - TFT_LOG_LINES) : 0;
   for (int line = 0; line < TFT_LOG_LINES; line++) {
-    int idx = logCount - TFT_LOG_LINES + line;
-    if (idx < 0 || idx >= logCount) {
+    int idx = visibleStart + line;
+    bool hasEntry = idx < logCount;
+
+    if (!hasEntry) {
+      if (displayedLogUsed[line]) {
+        drawLogLine(line, -1);
+      }
       continue;
     }
 
     const CANMessage& logEntry = getCANLogAt(idx);
-    uint32_t pos = parsePos(logEntry.data);
-    char buffer[48];
-    snprintf(buffer, sizeof(buffer), "N%03lX P:%lu T:%lu",
-             (unsigned long)logEntry.id,
-             (unsigned long)pos,
-             (unsigned long)logEntry.timestamp);
-
-    tft.setCursor(6, LOG_Y + (line * 12));
-    tft.print(buffer);
+    if (!displayedLogUsed[line] ||
+        displayedLogIndices[line] != idx ||
+        displayedLogIds[line] != logEntry.id ||
+        displayedLogTimestamps[line] != logEntry.timestamp) {
+      drawLogLine(line, idx);
+    }
   }
 }
 
@@ -612,7 +673,7 @@ void refreshDisplayDirtyFlags() {
       lag != displayCache.selectedLag ||
       selected.active != displayCache.selectedActive ||
       selected.starting != displayCache.selectedStarting ||
-      selected.responding != displayCache.selectedResponding) {
+      selected.linkHealthy != displayCache.selectedLinkHealthy) {
     markDisplayDirty(DIRTY_SELECTED);
   }
 
@@ -621,8 +682,8 @@ void refreshDisplayDirtyFlags() {
       servo2.active != displayCache.s2Active ||
       servo1.starting != displayCache.s1Starting ||
       servo2.starting != displayCache.s2Starting ||
-      servo1.responding != displayCache.s1Responding ||
-      servo2.responding != displayCache.s2Responding) {
+      servo1.linkHealthy != displayCache.s1LinkHealthy ||
+      servo2.linkHealthy != displayCache.s2LinkHealthy) {
     markDisplayDirty(DIRTY_BUTTONS);
   }
 
@@ -641,13 +702,13 @@ void updateDisplayCache() {
   displayCache.selectedServo = selectedServo;
   displayCache.selectedActive = selected.active;
   displayCache.selectedStarting = selected.starting;
-  displayCache.selectedResponding = selected.responding;
+  displayCache.selectedLinkHealthy = selected.linkHealthy;
   displayCache.s1Active = servo1.active;
   displayCache.s2Active = servo2.active;
   displayCache.s1Starting = servo1.starting;
   displayCache.s2Starting = servo2.starting;
-  displayCache.s1Responding = servo1.responding;
-  displayCache.s2Responding = servo2.responding;
+  displayCache.s1LinkHealthy = servo1.linkHealthy;
+  displayCache.s2LinkHealthy = servo2.linkHealthy;
   displayCache.canLogVersion = canLogVersion;
 }
 
