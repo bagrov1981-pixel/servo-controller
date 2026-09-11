@@ -165,6 +165,9 @@ int displayedLogIndices[TFT_LOG_LINES] = {-1, -1, -1, -1, -1, -1};
 unsigned long displayedLogIds[TFT_LOG_LINES] = {
   0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
 };
+uint32_t displayedLogPositions[TFT_LOG_LINES] = {
+  0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+};
 unsigned long displayedLogTimestamps[TFT_LOG_LINES] = {
   0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
 };
@@ -235,6 +238,10 @@ void appendCANLog(uint32_t id, uint8_t dlc, const uint8_t* data) {
   msg.dlc = dlc;
   msg.timestamp = millis();
   for (int i = 0; i < 8; i++) {
+    msg.data[i] = 0;
+  }
+  int bytesToCopy = (dlc < 8) ? dlc : 8;
+  for (int i = 0; i < bytesToCopy; i++) {
     msg.data[i] = data[i];
   }
 
@@ -253,6 +260,7 @@ void resetDisplayedLogsCache() {
   for (int i = 0; i < TFT_LOG_LINES; i++) {
     displayedLogIndices[i] = -1;
     displayedLogIds[i] = 0xFFFFFFFFUL;
+    displayedLogPositions[i] = 0xFFFFFFFFUL;
     displayedLogTimestamps[i] = 0xFFFFFFFFUL;
     displayedLogUsed[i] = false;
   }
@@ -339,13 +347,16 @@ void applyServoResponse(const twai_message_t& rx) {
 
 void processCANReceive(TickType_t waitTicks = 0) {
   twai_message_t rx = {};
-  while (twai_receive(&rx, waitTicks) == ESP_OK) {
+  if (twai_receive(&rx, waitTicks) != ESP_OK) {
+    return;
+  }
+
+  do {
     if ((rx.identifier == NODE_ID_SERVO1 || rx.identifier == NODE_ID_SERVO2) &&
         rx.data_length_code >= 8) {
       applyServoResponse(rx);
     }
-    waitTicks = 0;
-  }
+  } while (twai_receive(&rx, 0) == ESP_OK);
 }
 
 void beginServoStartProbe(int servoNum) {
@@ -408,6 +419,7 @@ void stopServoMotion(int servoNum) {
   servo.stepIndex = 0;
   servo.pauseUntil = 0;
   servo.probeStartedAt = 0;
+  servo.commandedPos = servo.currentPos;
   markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
 }
 
@@ -612,6 +624,7 @@ void drawLogLine(int line, int idx) {
   if (idx < 0 || idx >= logCount) {
     displayedLogIndices[line] = -1;
     displayedLogIds[line] = 0xFFFFFFFFUL;
+    displayedLogPositions[line] = 0xFFFFFFFFUL;
     displayedLogTimestamps[line] = 0xFFFFFFFFUL;
     displayedLogUsed[line] = false;
     return;
@@ -632,6 +645,7 @@ void drawLogLine(int line, int idx) {
 
   displayedLogIndices[line] = idx;
   displayedLogIds[line] = logEntry.id;
+  displayedLogPositions[line] = pos;
   displayedLogTimestamps[line] = logEntry.timestamp;
   displayedLogUsed[line] = true;
 }
@@ -650,9 +664,11 @@ void drawLogs() {
     }
 
     const CANMessage& logEntry = getCANLogAt(idx);
+    uint32_t pos = parsePos(logEntry.data);
     if (!displayedLogUsed[line] ||
         displayedLogIndices[line] != idx ||
         displayedLogIds[line] != logEntry.id ||
+        displayedLogPositions[line] != pos ||
         displayedLogTimestamps[line] != logEntry.timestamp) {
       drawLogLine(line, idx);
     }
