@@ -62,6 +62,7 @@ const int TOTAL_STEPS = 180;
 const unsigned long STEP_DELAY = 30;
 const unsigned long RESPONSE_TIMEOUT = 150;
 const unsigned long MOTION_PAUSE_MS = 1000;
+const unsigned long START_PROBE_TIMEOUT_MS = 1500;
 const unsigned long TOUCH_DEBOUNCE_MS = 250;
 const unsigned long START_DEBOUNCE_MS = 40;
 const unsigned long LINK_STALE_MS = 1000;
@@ -404,7 +405,7 @@ void serviceServoMotion(int servoNum) {
       Serial.print(servo.responseCount);
       Serial.println(" responses)");
       markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
-    } else if ((now - servo.probeStartedAt) >= RESPONSE_TIMEOUT * 4) {
+    } else if ((now - servo.probeStartedAt) >= START_PROBE_TIMEOUT_MS) {
       servo.starting = false;
       servo.active = false;
       Serial.print("[ERROR] NO RESPONSE from Servo ");
@@ -580,7 +581,7 @@ void drawLogs() {
     uint32_t pos = parsePos(canLogs[idx].data);
     char buffer[48];
     snprintf(buffer, sizeof(buffer), "N%03lX P:%lu T:%lu",
-             canLogs[idx].id,
+             (unsigned long)canLogs[idx].id,
              (unsigned long)pos,
              (unsigned long)canLogs[idx].timestamp);
 
