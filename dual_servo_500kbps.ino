@@ -5,6 +5,7 @@
 #include <Adafruit_ST7789.h>
 #include <XPT2046_Touchscreen.h>
 #include <SPI.h>
+#include <math.h>
 
 // ========== PIN DEFINITIONS ==========
 #define TFT_CS   10
@@ -17,6 +18,31 @@
 #define SPI_MOSI   13
 #define CAN_TX_PIN 5
 #define CAN_RX_PIN 4
+#define START_BUTTON_PIN 15
+
+// ========== DISPLAY LAYOUT ==========
+#define SCREEN_W 320
+#define SCREEN_H 240
+
+#define BTN_SEL1_X 10
+#define BTN_SEL1_Y 30
+#define BTN_SEL1_W 145
+#define BTN_SEL1_H 72
+
+#define BTN_SEL2_X 165
+#define BTN_SEL2_Y 30
+#define BTN_SEL2_W 145
+#define BTN_SEL2_H 72
+
+#define INFO_X 0
+#define INFO_Y 112
+#define INFO_W 320
+#define INFO_H 42
+
+#define LOG_X 0
+#define LOG_Y 164
+#define LOG_W 320
+#define LOG_H 76
 
 // ========== HARDWARE INIT ==========
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
@@ -24,17 +50,27 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 WebServer server(80);
 
 // ========== MD89MW-CAN PARAMETERS (500kbps) ==========
-const uint32_t CENTER_POS = 8192;      // 4.096ms - Neutral
-const uint32_t LEFT_POS = 4096;        // 2.048ms - 90° Left
-const uint32_t RIGHT_POS = 12288;      // 6.144ms - 90° Right
+const uint32_t CENTER_POS = 8192;
+const uint32_t LEFT_POS = 4096;
+const uint32_t RIGHT_POS = 12288;
 
 const uint32_t NODE_ID_SERVO1 = 0x000;
 const uint32_t NODE_ID_SERVO2 = 0x001;
 
 // ========== MOTION PARAMETERS ==========
 const int TOTAL_STEPS = 180;
-const int STEP_DELAY = 30;             // 30ms - better synchronization
-const int RESPONSE_TIMEOUT = 150;
+const unsigned long STEP_DELAY = 30;
+const unsigned long RESPONSE_TIMEOUT = 150;
+const unsigned long MOTION_PAUSE_MS = 1000;
+const unsigned long START_PROBE_TIMEOUT_MS = 1500;
+const unsigned long TOUCH_DEBOUNCE_MS = 250;
+const unsigned long START_DEBOUNCE_MS = 40;
+const unsigned long LINK_STALE_MS = 2500;
+const unsigned long TFT_UPDATE_INTERVAL_MS = 50;
+const int MAX_CAN_LOGS = 50;
+const int TFT_LOG_LINES = 6;
+const int START_PROBE_TOLERANCE = 50;
+const float MOTION_CURVE_PI = 3.14159265f;
 
 // ========== DATA STRUCTURES ==========
 struct CANMessage {
@@ -48,46 +84,125 @@ struct ServoState {
   uint32_t currentPos;
   uint32_t commandedPos;
   bool active;
+  bool starting;
   bool responding;
+  bool hasResponse;
+  bool linkHealthy;
   int responseCount;
+  bool directionForward;
+  bool boundaryHoldSent;
+  int stepIndex;
+  unsigned long lastStepAt;
+  bool pauseActive;
+  unsigned long pauseStartedAt;
+  unsigned long lastResponseAt;
+  unsigned long probeStartedAt;
 };
 
-CANMessage canLogs[50];
-int logCount = 0;
+struct DisplayCache {
+  uint32_t s1Pos;
+  uint32_t s2Pos;
+  uint32_t selectedCurrent;
+  uint32_t selectedCommanded;
+  int32_t selectedLag;
+  int selectedServo;
+  bool selectedActive;
+  bool selectedStarting;
+  bool selectedLinkHealthy;
+  bool s1Active;
+  bool s2Active;
+  bool s1Starting;
+  bool s2Starting;
+  bool s1LinkHealthy;
+  bool s2LinkHealthy;
+  uint32_t canLogVersion;
+};
 
-ServoState servo1 = {CENTER_POS, CENTER_POS, false, false, 0};
-ServoState servo2 = {CENTER_POS, CENTER_POS, false, false, 0};
-int selectedServo = 1;  // 1 or 2
+enum DisplayDirtyFlags : uint8_t {
+  DIRTY_NONE = 0,
+  DIRTY_STATIC = 1 << 0,
+  DIRTY_SUMMARY = 1 << 1,
+  DIRTY_BUTTONS = 1 << 2,
+  DIRTY_SELECTED = 1 << 3,
+  DIRTY_LOGS = 1 << 4,
+  DIRTY_ALL = DIRTY_STATIC | DIRTY_SUMMARY | DIRTY_BUTTONS | DIRTY_SELECTED | DIRTY_LOGS
+};
+
+ServoState makeServoState() {
+  ServoState servo = {};
+  servo.currentPos = CENTER_POS;
+  servo.commandedPos = CENTER_POS;
+  servo.active = false;
+  servo.starting = false;
+  servo.responding = false;
+  servo.hasResponse = false;
+  servo.linkHealthy = false;
+  servo.responseCount = 0;
+  servo.directionForward = true;
+  servo.boundaryHoldSent = false;
+  servo.stepIndex = 0;
+  servo.lastStepAt = 0;
+  servo.pauseActive = false;
+  servo.pauseStartedAt = 0;
+  servo.lastResponseAt = 0;
+  servo.probeStartedAt = 0;
+  return servo;
+}
+
+CANMessage canLogs[MAX_CAN_LOGS];
+int logCount = 0;
+int logStart = 0;
+uint32_t canLogVersion = 0;
+
+ServoState servo1 = makeServoState();
+ServoState servo2 = makeServoState();
+int selectedServo = 1;
 
 unsigned long lastTftUpdate = 0;
 unsigned long lastTouchTime = 0;
+unsigned long lastStartButtonChange = 0;
+bool lastStartButtonReading = HIGH;
+bool startButtonStableState = HIGH;
 
-// ========== TOUCHSCREEN BUTTON DEFINITIONS ==========
-#define BTN_SEL1_X 10
-#define BTN_SEL1_Y 10
-#define BTN_SEL1_W 80
-#define BTN_SEL1_H 40
+bool displayInitialized = false;
+bool displayDirty = true;
+uint8_t displayDirtyFlags = DIRTY_ALL;
+DisplayCache displayCache = {
+  0xFFFFFFFFUL,
+  0xFFFFFFFFUL,
+  0xFFFFFFFFUL,
+  0xFFFFFFFFUL,
+  0x7FFFFFFF,
+  -1,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  0xFFFFFFFFUL
+};
 
-#define BTN_SEL2_X 100
-#define BTN_SEL2_Y 10
-#define BTN_SEL2_W 80
-#define BTN_SEL2_H 40
-
-#define BTN_CTRL_X 190
-#define BTN_CTRL_Y 10
-#define BTN_CTRL_W 130
-#define BTN_CTRL_H 40
-
-#define BTN_CLR_X 10
-#define BTN_CLR_Y 190
-#define BTN_CLR_W 310
-#define BTN_CLR_H 40
+int displayedLogIndices[TFT_LOG_LINES] = {-1, -1, -1, -1, -1, -1};
+unsigned long displayedLogIds[TFT_LOG_LINES] = {
+  0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+};
+uint32_t displayedLogPositions[TFT_LOG_LINES] = {
+  0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+};
+unsigned long displayedLogTimestamps[TFT_LOG_LINES] = {
+  0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+};
+bool displayedLogUsed[TFT_LOG_LINES] = {false, false, false, false, false, false};
 
 // ========== UTILITY FUNCTIONS ==========
 void printCAN(const char* dir, uint32_t nodeId, const twai_message_t& msg) {
   Serial.print("[");
   Serial.print(dir);
-  Serial.print "][N");
+  Serial.print("][N");
   Serial.print(nodeId, HEX);
   Serial.print("] ");
   uint32_t pos = msg.data[4] | (msg.data[5] << 8) | (msg.data[6] << 16) | (msg.data[7] << 24);
@@ -103,14 +218,113 @@ ServoState& getSelectedServo() {
   return (selectedServo == 1) ? servo1 : servo2;
 }
 
-uint32_t getServoNodeId() {
-  return (selectedServo == 1) ? NODE_ID_SERVO1 : NODE_ID_SERVO2;
+ServoState& getServoByNumber(int servoNum) {
+  return (servoNum == 1) ? servo1 : servo2;
+}
+
+ServoState* findServoByNodeId(uint32_t nodeId) {
+  if (nodeId == NODE_ID_SERVO1) {
+    return &servo1;
+  }
+  if (nodeId == NODE_ID_SERVO2) {
+    return &servo2;
+  }
+  return nullptr;
+}
+
+uint32_t getServoNodeId(int servoNum) {
+  return (servoNum == 1) ? NODE_ID_SERVO1 : NODE_ID_SERVO2;
+}
+
+uint32_t getServoOuterPos(int servoNum) {
+  return (servoNum == 1) ? RIGHT_POS : LEFT_POS;
+}
+
+void markDisplayDirty(uint8_t flags = DIRTY_ALL) {
+  displayDirty = true;
+  displayDirtyFlags |= flags;
+}
+
+const CANMessage& getCANLogAt(int index) {
+  return canLogs[(logStart + index) % MAX_CAN_LOGS];
+}
+
+void appendCANLog(uint32_t id, uint8_t dlc, const uint8_t* data) {
+  int writeIndex = (logStart + logCount) % MAX_CAN_LOGS;
+  if (logCount >= MAX_CAN_LOGS) {
+    writeIndex = logStart;
+    logStart = (logStart + 1) % MAX_CAN_LOGS;
+  } else {
+    logCount++;
+  }
+
+  CANMessage& msg = canLogs[writeIndex];
+  msg.id = id;
+  msg.dlc = dlc;
+  msg.timestamp = millis();
+  for (int i = 0; i < 8; i++) {
+    msg.data[i] = 0;
+  }
+  int bytesToCopy = (dlc < 8) ? dlc : 8;
+  for (int i = 0; i < bytesToCopy; i++) {
+    msg.data[i] = data[i];
+  }
+
+  canLogVersion++;
+  markDisplayDirty(DIRTY_LOGS);
+}
+
+void clearLogs() {
+  logCount = 0;
+  logStart = 0;
+  canLogVersion++;
+  markDisplayDirty(DIRTY_LOGS);
+}
+
+void resetDisplayedLogsCache() {
+  for (int i = 0; i < TFT_LOG_LINES; i++) {
+    displayedLogIndices[i] = -1;
+    displayedLogIds[i] = 0xFFFFFFFFUL;
+    displayedLogPositions[i] = 0xFFFFFFFFUL;
+    displayedLogTimestamps[i] = 0xFFFFFFFFUL;
+    displayedLogUsed[i] = false;
+  }
+}
+
+bool isInsideRect(int x, int y, int rx, int ry, int rw, int rh) {
+  return x >= rx && x < (rx + rw) && y >= ry && y < (ry + rh);
+}
+
+int32_t servoLag(const ServoState& servo) {
+  return (int32_t)servo.commandedPos - (int32_t)servo.currentPos;
+}
+
+int32_t abs32(int32_t value) {
+  return value < 0 ? -value : value;
+}
+
+bool updateDebouncedPress(bool reading, unsigned long now, bool& lastReading, bool& stableState, unsigned long& lastChangeAt) {
+  if (reading != lastReading) {
+    lastChangeAt = now;
+    lastReading = reading;
+  }
+
+  if ((now - lastChangeAt) < START_DEBOUNCE_MS) {
+    return false;
+  }
+
+  if (reading != stableState) {
+    stableState = reading;
+    return stableState == LOW;
+  }
+
+  return false;
 }
 
 // ========== CAN INITIALIZATION ==========
 bool initCAN_500kbps() {
   Serial.println("\n[CAN] Initializing at 500kbps...");
-  
+
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
     (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL
   );
@@ -124,7 +338,7 @@ bool initCAN_500kbps() {
     Serial.println("[ERROR] Failed to install driver");
     return false;
   }
-  
+
   if (twai_start() != ESP_OK) {
     Serial.println("[ERROR] Failed to start driver");
     twai_driver_uninstall();
@@ -142,7 +356,7 @@ void sendCANFrame(uint32_t position, uint32_t nodeId) {
   tx_msg.identifier = nodeId;
   tx_msg.data_length_code = 8;
   tx_msg.flags = 0;
-  
+
   tx_msg.data[0] = 0x96;
   tx_msg.data[1] = 0x00;
   tx_msg.data[2] = 0x1E;
@@ -151,311 +365,513 @@ void sendCANFrame(uint32_t position, uint32_t nodeId) {
   tx_msg.data[5] = ((position >> 8) & 0xFF);
   tx_msg.data[6] = ((position >> 16) & 0xFF);
   tx_msg.data[7] = ((position >> 24) & 0xFF);
-  
+
   if (twai_transmit(&tx_msg, pdMS_TO_TICKS(50)) == ESP_OK) {
-    CANMessage msg;
-    msg.id = tx_msg.identifier;
-    msg.dlc = tx_msg.data_length_code;
-    msg.timestamp = millis();
-    for (int i = 0; i < 8; i++) msg.data[i] = tx_msg.data[i];
-    if (logCount < 50) canLogs[logCount++] = msg;
-    
+    appendCANLog(tx_msg.identifier, tx_msg.data_length_code, tx_msg.data);
     printCAN("TX", nodeId, tx_msg);
+  } else {
+    Serial.print("[ERROR] TX failed for node ");
+    Serial.println(nodeId, HEX);
   }
 }
 
-void waitForServoResponse(uint32_t targetPos, uint32_t nodeId, int timeoutMs) {
-  unsigned long startTime = millis();
-  ServoState& servo = (nodeId == NODE_ID_SERVO1) ? servo1 : servo2;
-  
-  while (millis() - startTime < timeoutMs) {
-    twai_message_t rx = {0};
-    if (twai_receive(&rx, pdMS_TO_TICKS(5)) == ESP_OK) {
-      if (rx.identifier == nodeId && rx.data_length_code >= 8) {
-        servo.currentPos = parsePos(rx.data);
-        servo.responding = true;
-        servo.responseCount++;
-        
-        CANMessage msg;
-        msg.id = rx.identifier;
-        msg.dlc = rx.data_length_code;
-        msg.timestamp = millis();
-        for (int i = 0; i < 8; i++) msg.data[i] = rx.data[i];
-        if (logCount < 50) canLogs[logCount++] = msg;
-        
-        printCAN("RX", nodeId, rx);
-        
-        if (abs((int32_t)servo.currentPos - (int32_t)targetPos) < 50) {
-          return;
-        }
-      }
+void applyServoResponse(const twai_message_t& rx) {
+  ServoState* servo = findServoByNodeId(rx.identifier);
+  if (servo == nullptr) {
+    return;
+  }
+
+  servo->currentPos = parsePos(rx.data);
+  servo->responding = true;
+  servo->hasResponse = true;
+  servo->linkHealthy = true;
+  servo->responseCount++;
+  servo->lastResponseAt = millis();
+
+  appendCANLog(rx.identifier, rx.data_length_code, rx.data);
+  printCAN("RX", rx.identifier, rx);
+  markDisplayDirty(DIRTY_SUMMARY | DIRTY_SELECTED | DIRTY_BUTTONS);
+}
+
+void processCANReceive(TickType_t waitTicks = 0) {
+  twai_message_t rx = {};
+  if (twai_receive(&rx, waitTicks) != ESP_OK) {
+    return;
+  }
+
+  do {
+    if ((rx.identifier == NODE_ID_SERVO1 || rx.identifier == NODE_ID_SERVO2) &&
+        rx.data_length_code >= 8) {
+      applyServoResponse(rx);
     }
-  }
+  } while (twai_receive(&rx, 0) == ESP_OK);
 }
 
-void testServoResponse(uint32_t nodeId) {
-  ServoState& servo = (nodeId == NODE_ID_SERVO1) ? servo1 : servo2;
-  int servoNum = (nodeId == NODE_ID_SERVO1) ? 1 : 2;
-  
+void beginServoStartProbe(int servoNum) {
+  ServoState& servo = getServoByNumber(servoNum);
+
   Serial.print("\n========== SERVO ");
   Serial.print(servoNum);
   Serial.println(" TEST ==========");
-  
+
+  servo.active = false;
+  servo.starting = true;
   servo.responding = false;
+  servo.hasResponse = false;
+  servo.linkHealthy = false;
   servo.responseCount = 0;
-  
+  servo.boundaryHoldSent = true;
+  servo.lastResponseAt = 0;
+  servo.probeStartedAt = millis();
+  servo.commandedPos = CENTER_POS;
+
   Serial.print("[TEST] Sending CENTER position to Servo ");
   Serial.println(servoNum);
-  sendCANFrame(CENTER_POS, nodeId);
-  
-  waitForServoResponse(CENTER_POS, nodeId, 1500);
-  
-  if (servo.responding) {
-    Serial.print("[OK] Servo ");
-    Serial.print(servoNum);
-    Serial.print(" is responding! (");
-    Serial.print(servo.responseCount);
-    Serial.println(" responses)");
-  } else {
-    Serial.print("[ERROR] NO RESPONSE from Servo ");
-    Serial.println(servoNum);
-  }
+  sendCANFrame(CENTER_POS, getServoNodeId(servoNum));
+  markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS | DIRTY_SUMMARY);
 }
 
 // ========== MOTION CONTROL ==========
-void moveSmooth(uint32_t start, uint32_t end, uint32_t nodeId, bool forward) {
-  ServoState& servo = (nodeId == NODE_ID_SERVO1) ? servo1 : servo2;
-  int servoNum = (nodeId == NODE_ID_SERVO1) ? 1 : 2;
-  
-  Serial.print("\n>>> Servo");
-  Serial.print(servoNum);
-  Serial.print(" ");
-  Serial.print(forward ? "FORWARD" : "BACKWARD");
-  Serial.print(" (");
-  Serial.print(start);
-  Serial.print(" -> ");
-  Serial.print(end);
-  Serial.println(")");
-  
-  int32_t distance = (int32_t)end - (int32_t)start;
-  
-  for (int i = 0; i <= TOTAL_STEPS; i++) {
-    if (!servo.active) break;
-    
-    // S-curve синусоїда для плавного руху
-    float progress = (float)i / (float)TOTAL_STEPS;
-    float curve = (1.0 - cos(progress * PI)) / 2.0;
-    uint32_t target = start + (int32_t)(distance * curve);
-    
-    servo.commandedPos = target;
-    
-    Serial.print("S");
-    Serial.print(servoNum);
-    Serial.print(" Step ");
-    Serial.print(i);
-    Serial.print("/");
-    Serial.print(TOTAL_STEPS);
-    Serial.print(" | Cmd:");
-    Serial.print(target);
-    Serial.print(" | Pos:");
-    Serial.print(servo.currentPos);
-    
-    int32_t lag = (int32_t)target - (int32_t)servo.currentPos;
-    Serial.print(" | Lag:");
-    Serial.println(lag);
-    
-    sendCANFrame(target, nodeId);
-    waitForServoResponse(target, nodeId, RESPONSE_TIMEOUT);
-    
-    delay(STEP_DELAY);
+void startServoMotion(int servoNum) {
+  ServoState& servo = getServoByNumber(servoNum);
+
+  if (servo.active || servo.starting) {
+    return;
   }
-  
-  Serial.print("[DONE] Servo");
-  Serial.print(servoNum);
-  Serial.println(" motion complete");
+
+  Serial.print("[CONTROL] Starting Servo ");
+  Serial.println(servoNum);
+
+  servo.directionForward = true;
+  servo.boundaryHoldSent = true;
+  servo.stepIndex = 0;
+  servo.lastStepAt = 0;
+  servo.pauseActive = false;
+  servo.pauseStartedAt = 0;
+  servo.probeStartedAt = 0;
+  servo.commandedPos = CENTER_POS;
+  markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS | DIRTY_SUMMARY);
+
+  beginServoStartProbe(servoNum);
+}
+
+void stopServoMotion(int servoNum) {
+  ServoState& servo = getServoByNumber(servoNum);
+  if (!servo.active && !servo.starting) {
+    return;
+  }
+
+  Serial.print("[CONTROL] Stopping Servo ");
+  Serial.println(servoNum);
+
+  servo.active = false;
+  servo.starting = false;
+  servo.directionForward = true;
+  servo.boundaryHoldSent = true;
+  servo.stepIndex = 0;
+  servo.lastStepAt = 0;
+  servo.pauseActive = false;
+  servo.pauseStartedAt = 0;
+  servo.probeStartedAt = 0;
+  servo.commandedPos = servo.currentPos;
+  markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+}
+
+void toggleServoMotion(int servoNum) {
+  ServoState& servo = getServoByNumber(servoNum);
+  if (servo.active || servo.starting) {
+    stopServoMotion(servoNum);
+  } else {
+    startServoMotion(servoNum);
+  }
+}
+
+void serviceServoMotion(int servoNum) {
+  ServoState& servo = getServoByNumber(servoNum);
+  unsigned long now = millis();
+
+  if (servo.starting) {
+    if (servo.hasResponse &&
+        abs32((int32_t)servo.currentPos - (int32_t)CENTER_POS) < START_PROBE_TOLERANCE) {
+      servo.starting = false;
+      servo.active = true;
+      servo.lastStepAt = 0;
+      servo.pauseActive = false;
+      servo.pauseStartedAt = 0;
+      Serial.print("[OK] Servo ");
+      Serial.print(servoNum);
+      Serial.print(" is responding! (");
+      Serial.print(servo.responseCount);
+      Serial.println(" responses)");
+      markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+    } else if ((now - servo.probeStartedAt) >= START_PROBE_TIMEOUT_MS) {
+      servo.starting = false;
+      servo.active = false;
+      servo.responding = false;
+      servo.hasResponse = false;
+      servo.linkHealthy = false;
+      servo.lastResponseAt = 0;
+      Serial.print("[ERROR] NO RESPONSE from Servo ");
+      Serial.println(servoNum);
+      markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+    }
+    return;
+  }
+
+  if (!servo.active) {
+    return;
+  }
+
+  if (servo.pauseActive) {
+    if ((now - servo.pauseStartedAt) < MOTION_PAUSE_MS) {
+      return;
+    }
+    servo.pauseActive = false;
+  }
+
+  if (servo.lastStepAt != 0 && (now - servo.lastStepAt) < STEP_DELAY) {
+    return;
+  }
+
+  uint32_t startPos = servo.directionForward ? CENTER_POS : getServoOuterPos(servoNum);
+  uint32_t endPos = servo.directionForward ? getServoOuterPos(servoNum) : CENTER_POS;
+  int32_t distance = (int32_t)endPos - (int32_t)startPos;
+  int stepToSend = servo.stepIndex;
+  if (servo.boundaryHoldSent && stepToSend == 0) {
+    stepToSend = 1;
+    servo.boundaryHoldSent = false;
+  }
+
+  float progress = (float)stepToSend / (float)TOTAL_STEPS;
+  float curve = (1.0f - cosf(progress * MOTION_CURVE_PI)) * 0.5f;
+  uint32_t target = startPos + (int32_t)(distance * curve);
+
+  servo.commandedPos = target;
+  servo.lastStepAt = now;
+  sendCANFrame(target, getServoNodeId(servoNum));
+  markDisplayDirty(DIRTY_SUMMARY | DIRTY_SELECTED);
+
+  if (stepToSend >= TOTAL_STEPS) {
+    servo.stepIndex = 0;
+    servo.directionForward = !servo.directionForward;
+    servo.boundaryHoldSent = true;
+    servo.pauseActive = true;
+    servo.pauseStartedAt = now;
+
+    Serial.print("[DONE] Servo ");
+    Serial.print(servoNum);
+    Serial.println(" reached segment end");
+  } else {
+    servo.stepIndex = stepToSend + 1;
+  }
+}
+
+void refreshServoLinkState() {
+  unsigned long now = millis();
+
+  bool servo1Healthy = servo1.hasResponse && (now - servo1.lastResponseAt) <= LINK_STALE_MS;
+  bool servo2Healthy = servo2.hasResponse && (now - servo2.lastResponseAt) <= LINK_STALE_MS;
+
+  if (servo1.linkHealthy != servo1Healthy) {
+    servo1.linkHealthy = servo1Healthy;
+    markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+  }
+
+  if (servo2.linkHealthy != servo2Healthy) {
+    servo2.linkHealthy = servo2Healthy;
+    markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
+  }
 }
 
 // ========== TOUCHSCREEN UI ==========
-void drawTouchButtons() {
-  // SERVO 1 BUTTON
-  uint16_t color1 = (selectedServo == 1) ? 0x07E0 : 0x4208;
-  tft.fillRect(BTN_SEL1_X, BTN_SEL1_Y, BTN_SEL1_W, BTN_SEL1_H, color1);
-  tft.drawRect(BTN_SEL1_X, BTN_SEL1_Y, BTN_SEL1_W, BTN_SEL1_H, ST77XX_WHITE);
-  tft.setTextColor(ST77XX_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(BTN_SEL1_X + 12, BTN_SEL1_Y + 12);
-  tft.print("S1");
-  if (servo1.responding) {
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_GREEN);
-    tft.setCursor(BTN_SEL1_X + 12, BTN_SEL1_Y + 28);
-    tft.print("OK");
-  }
+void drawStaticLayout() {
+  tft.fillScreen(ST77XX_BLACK);
+  resetDisplayedLogsCache();
 
-  // SERVO 2 BUTTON
-  uint16_t color2 = (selectedServo == 2) ? 0x07E0 : 0x4208;
-  tft.fillRect(BTN_SEL2_X, BTN_SEL2_Y, BTN_SEL2_W, BTN_SEL2_H, color2);
-  tft.drawRect(BTN_SEL2_X, BTN_SEL2_Y, BTN_SEL2_W, BTN_SEL2_H, ST77XX_WHITE);
-  tft.setTextColor(ST77XX_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(BTN_SEL2_X + 12, BTN_SEL2_Y + 12);
-  tft.print("S2");
-  if (servo2.responding) {
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_GREEN);
-    tft.setCursor(BTN_SEL2_X + 12, BTN_SEL2_Y + 28);
-    tft.print("OK");
-  }
-
-  // CONTROL BUTTON
-  ServoState& active = getSelectedServo();
-  uint16_t ctrlColor = active.active ? 0xF800 : 0x07E0;
-  tft.fillRect(BTN_CTRL_X, BTN_CTRL_Y, BTN_CTRL_W, BTN_CTRL_H, ctrlColor);
-  tft.drawRect(BTN_CTRL_X, BTN_CTRL_Y, BTN_CTRL_W, BTN_CTRL_H, ST77XX_WHITE);
-  tft.setTextColor(ST77XX_BLACK);
+  tft.fillRect(0, 0, SCREEN_W, 22, 0x0011);
   tft.setTextSize(1);
-  tft.setCursor(BTN_CTRL_X + 20, BTN_CTRL_Y + 5);
-  tft.print("MOVE");
-  tft.setCursor(BTN_CTRL_X + 10, BTN_CTRL_Y + 20);
-  tft.print(active.active ? "STOP" : "START");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(6, 4);
+  tft.print("MD89MW-CAN 500kbps");
+  tft.setCursor(190, 4);
+  tft.print("START toggles");
+  tft.setCursor(200, 14);
+  tft.print("touch selects");
 
-  // CLEAR BUTTON
-  tft.fillRect(BTN_CLR_X, BTN_CLR_Y, BTN_CLR_W, BTN_CLR_H, 0xF81F);
-  tft.drawRect(BTN_CLR_X, BTN_CLR_Y, BTN_CLR_W, BTN_CLR_H, ST77XX_WHITE);
+  tft.drawRect(INFO_X, INFO_Y, INFO_W, INFO_H, 0x03EF);
+  tft.drawFastHLine(0, LOG_Y - 2, SCREEN_W, 0x03EF);
+  tft.setCursor(6, LOG_Y - 14);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("CAN log");
+}
+
+void drawSummaryLine() {
+  tft.fillRect(6, 13, 170, 8, 0x0011);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(6, 14);
+  tft.print("S1:");
+  tft.print(servo1.currentPos);
+  tft.print("  S2:");
+  tft.print(servo2.currentPos);
+}
+
+void drawServoButton(int servoNum, int x, int y, int w, int h) {
+  ServoState& servo = getServoByNumber(servoNum);
+  bool selected = (selectedServo == servoNum);
+
+  uint16_t fillColor = selected ? 0x05EF : 0x3186;
+  if (servo.active) {
+    fillColor = selected ? 0xFD20 : 0xC3A0;
+  }
+
+  tft.fillRect(x, y, w, h, fillColor);
+  tft.drawRect(x, y, w, h, ST77XX_WHITE);
+  if (selected) {
+    tft.drawRect(x + 2, y + 2, w - 4, h - 4, ST77XX_YELLOW);
+  }
+
   tft.setTextColor(ST77XX_BLACK);
+  tft.setTextSize(3);
+  tft.setCursor(x + 40, y + 12);
+  tft.print("S");
+  tft.print(servoNum);
+
+  tft.setTextSize(1);
+  tft.setCursor(x + 10, y + 54);
+  tft.print(servo.starting ? "PING" : (servo.active ? "RUN" : "IDLE"));
+  tft.setCursor(x + w - 42, y + 54);
+  tft.print(servo.linkHealthy ? "OK" : "WAIT");
+}
+
+void drawServoSelectors() {
+  drawServoButton(1, BTN_SEL1_X, BTN_SEL1_Y, BTN_SEL1_W, BTN_SEL1_H);
+  drawServoButton(2, BTN_SEL2_X, BTN_SEL2_Y, BTN_SEL2_W, BTN_SEL2_H);
+}
+
+void drawSelectedServoPanel() {
+  ServoState& servo = getSelectedServo();
+  int32_t lag = servoLag(servo);
+
+  tft.fillRect(INFO_X + 1, INFO_Y + 1, INFO_W - 2, INFO_H - 2, ST77XX_BLACK);
+
   tft.setTextSize(2);
-  tft.setCursor(BTN_CLR_X + 120, BTN_CLR_Y + 10);
-  tft.print("CLEAR");
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(6, INFO_Y + 4);
+  tft.print("S");
+  tft.print(selectedServo);
+  tft.print(servo.starting ? " PING" : (servo.active ? " RUN" : " IDLE"));
+
+  tft.setTextSize(1);
+  tft.setTextColor(servo.linkHealthy ? ST77XX_GREEN : ST77XX_RED);
+  tft.setCursor(150, INFO_Y + 9);
+  tft.print(servo.linkHealthy ? "CAN OK" : "NO RESP");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(6, INFO_Y + 26);
+  tft.print("Pos:");
+  tft.print(servo.currentPos);
+  tft.setCursor(110, INFO_Y + 26);
+  tft.print("Cmd:");
+  tft.print(servo.commandedPos);
+
+  tft.setTextColor(lag == 0 ? ST77XX_GREEN : ST77XX_YELLOW);
+  tft.setCursor(230, INFO_Y + 26);
+  tft.print("Lag:");
+  tft.print(lag);
+}
+
+void drawLogLine(int line, int idx) {
+  int y = LOG_Y + (line * 12);
+  tft.fillRect(LOG_X, y, LOG_W, 11, ST77XX_BLACK);
+
+  if (idx < 0 || idx >= logCount) {
+    displayedLogIndices[line] = -1;
+    displayedLogIds[line] = 0xFFFFFFFFUL;
+    displayedLogPositions[line] = 0xFFFFFFFFUL;
+    displayedLogTimestamps[line] = 0xFFFFFFFFUL;
+    displayedLogUsed[line] = false;
+    return;
+  }
+
+  const CANMessage& logEntry = getCANLogAt(idx);
+  uint32_t pos = parsePos(logEntry.data);
+  char buffer[48];
+  snprintf(buffer, sizeof(buffer), "N%03lX P:%lu T:%lu",
+           (unsigned long)logEntry.id,
+           (unsigned long)pos,
+           (unsigned long)logEntry.timestamp);
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(6, y);
+  tft.print(buffer);
+
+  displayedLogIndices[line] = idx;
+  displayedLogIds[line] = logEntry.id;
+  displayedLogPositions[line] = pos;
+  displayedLogTimestamps[line] = logEntry.timestamp;
+  displayedLogUsed[line] = true;
+}
+
+void drawLogs() {
+  int visibleStart = (logCount > TFT_LOG_LINES) ? (logCount - TFT_LOG_LINES) : 0;
+  for (int line = 0; line < TFT_LOG_LINES; line++) {
+    int idx = visibleStart + line;
+    bool hasEntry = idx < logCount;
+
+    if (!hasEntry) {
+      if (displayedLogUsed[line]) {
+        drawLogLine(line, -1);
+      }
+      continue;
+    }
+
+    const CANMessage& logEntry = getCANLogAt(idx);
+    uint32_t pos = parsePos(logEntry.data);
+    if (!displayedLogUsed[line] ||
+        displayedLogIndices[line] != idx ||
+        displayedLogIds[line] != logEntry.id ||
+        displayedLogPositions[line] != pos ||
+        displayedLogTimestamps[line] != logEntry.timestamp) {
+      drawLogLine(line, idx);
+    }
+  }
+}
+
+void refreshDisplayDirtyFlags() {
+  ServoState& selected = getSelectedServo();
+  int32_t lag = servoLag(selected);
+
+  if (servo1.currentPos != displayCache.s1Pos || servo2.currentPos != displayCache.s2Pos) {
+    markDisplayDirty(DIRTY_SUMMARY);
+  }
+
+  if (selectedServo != displayCache.selectedServo ||
+      selected.currentPos != displayCache.selectedCurrent ||
+      selected.commandedPos != displayCache.selectedCommanded ||
+      lag != displayCache.selectedLag ||
+      selected.active != displayCache.selectedActive ||
+      selected.starting != displayCache.selectedStarting ||
+      selected.linkHealthy != displayCache.selectedLinkHealthy) {
+    markDisplayDirty(DIRTY_SELECTED);
+  }
+
+  if (selectedServo != displayCache.selectedServo ||
+      servo1.active != displayCache.s1Active ||
+      servo2.active != displayCache.s2Active ||
+      servo1.starting != displayCache.s1Starting ||
+      servo2.starting != displayCache.s2Starting ||
+      servo1.linkHealthy != displayCache.s1LinkHealthy ||
+      servo2.linkHealthy != displayCache.s2LinkHealthy) {
+    markDisplayDirty(DIRTY_BUTTONS);
+  }
+
+  if (canLogVersion != displayCache.canLogVersion) {
+    markDisplayDirty(DIRTY_LOGS);
+  }
+}
+
+void updateDisplayCache() {
+  ServoState& selected = getSelectedServo();
+  displayCache.s1Pos = servo1.currentPos;
+  displayCache.s2Pos = servo2.currentPos;
+  displayCache.selectedCurrent = selected.currentPos;
+  displayCache.selectedCommanded = selected.commandedPos;
+  displayCache.selectedLag = servoLag(selected);
+  displayCache.selectedServo = selectedServo;
+  displayCache.selectedActive = selected.active;
+  displayCache.selectedStarting = selected.starting;
+  displayCache.selectedLinkHealthy = selected.linkHealthy;
+  displayCache.s1Active = servo1.active;
+  displayCache.s2Active = servo2.active;
+  displayCache.s1Starting = servo1.starting;
+  displayCache.s2Starting = servo2.starting;
+  displayCache.s1LinkHealthy = servo1.linkHealthy;
+  displayCache.s2LinkHealthy = servo2.linkHealthy;
+  displayCache.canLogVersion = canLogVersion;
 }
 
 void updateDisplay() {
-  // HEADER
-  tft.fillRect(0, 0, 320, 60, 0x000F);
-  tft.setCursor(5, 5);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(2);
-  tft.print("500kbps");
-  tft.setCursor(5, 25);
-  tft.setTextSize(1);
-  tft.print("S1:");
-  tft.print(servo1.currentPos);
-  tft.print(" S2:");
-  tft.print(servo2.currentPos);
-
-  // SELECTED SERVO INFO
-  ServoState& selected = getSelectedServo();
-  tft.fillRect(0, 60, 320, 70, ST77XX_BLACK);
-  tft.setCursor(5, 65);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setTextSize(2);
-  tft.print("S");
-  tft.print(selectedServo);
-  tft.print(" Active");
-
-  tft.setTextSize(1);
-  tft.setTextColor(selected.responding ? ST77XX_GREEN : ST77XX_RED);
-  tft.setCursor(5, 85);
-  tft.print("Pos:");
-  tft.println(selected.currentPos);
-
-  tft.setCursor(5, 98);
-  tft.print("Cmd:");
-  tft.println(selected.commandedPos);
-
-  int32_t lag = (int32_t)selected.commandedPos - (int32_t)selected.currentPos;
-  tft.setTextColor(lag == 0 ? ST77XX_GREEN : ST77XX_YELLOW);
-  tft.setCursor(5, 111);
-  tft.print("Lag:");
-  tft.println(lag);
-
-  // CAN LOG (last 8 messages)
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_GREEN);
-  int y = 135;
-  for (int i = 0; i < 8; i++) {
-    tft.fillRect(0, y, 320, 12, ST77XX_BLACK);
-    int idx = logCount - 8 + i;
-    if (idx >= 0 && idx < logCount) {
-      tft.setCursor(5, y);
-      uint32_t pos = parsePos(canLogs[idx].data);
-      tft.print("N");
-      tft.print(canLogs[idx].id, HEX);
-      tft.print(":");
-      tft.print(pos);
-    }
-    y += 13;
+  if (!displayInitialized) {
+    drawStaticLayout();
+    displayInitialized = true;
+    markDisplayDirty(DIRTY_SUMMARY | DIRTY_BUTTONS | DIRTY_SELECTED | DIRTY_LOGS);
   }
 
-  drawTouchButtons();
+  refreshDisplayDirtyFlags();
+  if (!displayDirty) {
+    return;
+  }
+
+  uint8_t flags = displayDirtyFlags;
+  displayDirtyFlags = DIRTY_NONE;
+  displayDirty = false;
+  if (flags & DIRTY_STATIC) {
+    drawStaticLayout();
+    flags |= DIRTY_SUMMARY | DIRTY_BUTTONS | DIRTY_SELECTED | DIRTY_LOGS;
+  }
+  if (flags & DIRTY_SUMMARY) {
+    drawSummaryLine();
+  }
+  if (flags & DIRTY_BUTTONS) {
+    drawServoSelectors();
+  }
+  if (flags & DIRTY_SELECTED) {
+    drawSelectedServoPanel();
+  }
+  if (flags & DIRTY_LOGS) {
+    drawLogs();
+  }
+  updateDisplayCache();
+  displayDirty = displayDirtyFlags != DIRTY_NONE;
 }
 
 // ========== TOUCHSCREEN HANDLING ==========
 void handleTouch() {
-  if (!ts.touched() || millis() - lastTouchTime < 300) return;
+  if (!ts.touched() || (millis() - lastTouchTime) < TOUCH_DEBOUNCE_MS) {
+    return;
+  }
 
   SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
   TS_Point p = ts.getPoint();
   SPI.endTransaction();
 
-  int x = map(p.x, 3703, 463, 0, 320);
-  int y = map(p.y, 3110, 528, 0, 240);
+  int x = map(p.x, 3703, 463, 0, SCREEN_W - 1);
+  int y = map(p.y, 3110, 528, 0, SCREEN_H - 1);
 
   Serial.print("[TOUCH] X:");
   Serial.print(x);
   Serial.print(" Y:");
   Serial.println(y);
 
-  // SELECT SERVO 1
-  if (x >= BTN_SEL1_X && x <= (BTN_SEL1_X + BTN_SEL1_W) &&
-      y >= BTN_SEL1_Y && y <= (BTN_SEL1_Y + BTN_SEL1_H)) {
+  if (isInsideRect(x, y, BTN_SEL1_X, BTN_SEL1_Y, BTN_SEL1_W, BTN_SEL1_H)) {
     selectedServo = 1;
     Serial.println("[SELECT] Servo 1");
+    markDisplayDirty(DIRTY_BUTTONS | DIRTY_SELECTED);
     lastTouchTime = millis();
     return;
   }
 
-  // SELECT SERVO 2
-  if (x >= BTN_SEL2_X && x <= (BTN_SEL2_X + BTN_SEL2_W) &&
-      y >= BTN_SEL2_Y && y <= (BTN_SEL2_Y + BTN_SEL2_H)) {
+  if (isInsideRect(x, y, BTN_SEL2_X, BTN_SEL2_Y, BTN_SEL2_W, BTN_SEL2_H)) {
     selectedServo = 2;
     Serial.println("[SELECT] Servo 2");
-    lastTouchTime = millis();
-    return;
-  }
-
-  // CONTROL BUTTON
-  if (x >= BTN_CTRL_X && x <= (BTN_CTRL_X + BTN_CTRL_W) &&
-      y >= BTN_CTRL_Y && y <= (BTN_CTRL_Y + BTN_CTRL_H)) {
-    ServoState& servo = getSelectedServo();
-    uint32_t nodeId = getServoNodeId();
-    
-    if (!servo.active) {
-      Serial.print("[CONTROL] Starting Servo");
-      Serial.println(selectedServo);
-      servo.active = true;
-      testServoResponse(nodeId);
-      if (!servo.responding) {
-        servo.active = false;
-      }
-    } else {
-      Serial.print("[CONTROL] Stopping Servo");
-      Serial.println(selectedServo);
-      servo.active = false;
-    }
-    lastTouchTime = millis();
-    return;
-  }
-
-  // CLEAR LOGS
-  if (x >= BTN_CLR_X && x <= (BTN_CLR_X + BTN_CLR_W) &&
-      y >= BTN_CLR_Y && y <= (BTN_CLR_Y + BTN_CLR_H)) {
-    logCount = 0;
-    Serial.println("[CLEAR] Logs cleared");
+    markDisplayDirty(DIRTY_BUTTONS | DIRTY_SELECTED);
     lastTouchTime = millis();
     return;
   }
 
   lastTouchTime = millis();
+}
+
+void handleStartButton() {
+  bool reading = digitalRead(START_BUTTON_PIN);
+  unsigned long now = millis();
+  if (updateDebouncedPress(reading, now, lastStartButtonReading, startButtonStableState, lastStartButtonChange)) {
+    Serial.print("[START] Toggle selected servo ");
+    Serial.println(selectedServo);
+    toggleServoMotion(selectedServo);
+  }
 }
 
 // ========== WEB SERVER ==========
@@ -471,13 +887,13 @@ const char index_html[] PROGMEM = R"rawliteral(
         .servo-panel { display: inline-block; width: 48%; margin-right: 2%; vertical-align: top; }
         button { width: 100%; padding: 12px; background: #00d2ff; border: none; color: #000; font-weight: bold; border-radius: 4px; cursor: pointer; margin: 5px 0; }
         button.red { background: #ff4444; }
-        button.active { background: #44ff44; }
-        #log { background: #111; color: #0f0; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+        #log { background: #111; color: #0f0; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
     </style>
 </head>
 <body>
     <h2>Dual MD89MW-CAN Servo (500kbps)</h2>
-    
+    <p>On-device UI: touch S1 or S2 on the TFT, then press the physical START button.</p>
+
     <div class="servo-panel panel">
         <h3>Servo 1</h3>
         <div>Status: <span id="status1">-</span></div>
@@ -509,21 +925,23 @@ const char index_html[] PROGMEM = R"rawliteral(
     <script>
         setInterval(() => {
             fetch('/status').then(r => r.json()).then(d => {
-                document.getElementById('status1').textContent = d.s1_active ? 'ACTIVE' : 'IDLE';
+                document.getElementById('status1').textContent =
+                    (d.s1_starting ? 'STARTING' : (d.s1_active ? 'ACTIVE' : 'IDLE')) +
+                    (d.s1_link ? ' / CAN OK' : ' / WAIT');
                 document.getElementById('pos1').textContent = d.s1_pos;
                 document.getElementById('cmd1').textContent = d.s1_cmd;
                 document.getElementById('lag1').textContent = d.s1_lag;
-                
-                document.getElementById('status2').textContent = d.s2_active ? 'ACTIVE' : 'IDLE';
+
+                document.getElementById('status2').textContent =
+                    (d.s2_starting ? 'STARTING' : (d.s2_active ? 'ACTIVE' : 'IDLE')) +
+                    (d.s2_link ? ' / CAN OK' : ' / WAIT');
                 document.getElementById('pos2').textContent = d.s2_pos;
                 document.getElementById('cmd2').textContent = d.s2_cmd;
                 document.getElementById('lag2').textContent = d.s2_lag;
             });
             fetch('/logs').then(r => r.text()).then(d => {
-                if(d.trim()) {
-                    document.getElementById('log').innerHTML = d;
-                    document.getElementById('log').scrollTop = 9999;
-                }
+                document.getElementById('log').textContent = d.trim() ? d : 'Waiting...';
+                document.getElementById('log').scrollTop = 9999;
             });
         }, 500);
 
@@ -535,60 +953,64 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 void setupWebServer() {
-  server.on("/", []() { server.send(200, "text/html", index_html); });
-  
+  server.on("/", []() {
+    server.send(200, "text/html", index_html);
+  });
+
   server.on("/status", []() {
-    int32_t lag1 = (int32_t)servo1.commandedPos - (int32_t)servo1.currentPos;
-    int32_t lag2 = (int32_t)servo2.commandedPos - (int32_t)servo2.currentPos;
-    
-    String json = "{\"s1_active\":" + String(servo1.active ? "true" : "false") + 
-                  ",\"s1_pos\":" + String(servo1.currentPos) + 
-                  ",\"s1_cmd\":" + String(servo1.commandedPos) + 
-                  ",\"s1_lag\":" + String(lag1) + 
-                  ",\"s2_active\":" + String(servo2.active ? "true" : "false") + 
-                  ",\"s2_pos\":" + String(servo2.currentPos) + 
-                  ",\"s2_cmd\":" + String(servo2.commandedPos) + 
-                  ",\"s2_lag\":" + String(lag2) + "}";
+    String json = "{";
+    json += "\"selected\":" + String(selectedServo);
+    json += ",\"s1_active\":" + String(servo1.active ? "true" : "false");
+    json += ",\"s1_starting\":" + String(servo1.starting ? "true" : "false");
+    json += ",\"s1_link\":" + String(servo1.linkHealthy ? "true" : "false");
+    json += ",\"s1_pos\":" + String(servo1.currentPos);
+    json += ",\"s1_cmd\":" + String(servo1.commandedPos);
+    json += ",\"s1_lag\":" + String(servoLag(servo1));
+    json += ",\"s2_active\":" + String(servo2.active ? "true" : "false");
+    json += ",\"s2_starting\":" + String(servo2.starting ? "true" : "false");
+    json += ",\"s2_link\":" + String(servo2.linkHealthy ? "true" : "false");
+    json += ",\"s2_pos\":" + String(servo2.currentPos);
+    json += ",\"s2_cmd\":" + String(servo2.commandedPos);
+    json += ",\"s2_lag\":" + String(servoLag(servo2));
+    json += "}";
     server.send(200, "application/json", json);
   });
-  
+
   server.on("/toggle", []() {
-    int s = server.arg("s").toInt();
-    if (s == 1) {
-      if (!servo1.active) {
-        servo1.active = true;
-        testServoResponse(NODE_ID_SERVO1);
-        if (!servo1.responding) servo1.active = false;
-      } else {
-        servo1.active = false;
+    int servoNum = server.arg("s").toInt();
+    if (servoNum == 1 || servoNum == 2) {
+      selectedServo = servoNum;
+      if (getServoByNumber(servoNum).starting) {
+        server.send(200, "text/plain", "STARTING");
+        return;
       }
-    } else if (s == 2) {
-      if (!servo2.active) {
-        servo2.active = true;
-        testServoResponse(NODE_ID_SERVO2);
-        if (!servo2.responding) servo2.active = false;
-      } else {
-        servo2.active = false;
-      }
+      toggleServoMotion(servoNum);
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Invalid servo");
     }
+  });
+
+  server.on("/clear", []() {
+    clearLogs();
     server.send(200, "text/plain", "OK");
   });
-  
-  server.on("/clear", []() { logCount = 0; server.send(200, "text/plain", "OK"); });
-  
+
   server.on("/logs", []() {
-    String html = "";
-    for (int i = max(0, logCount - 30); i < logCount; i++) {
-      uint32_t pos = parsePos(canLogs[i].data);
+    String html;
+    html.reserve(30 * 40);
+    for (int i = (logCount > 30 ? logCount - 30 : 0); i < logCount; i++) {
+      const CANMessage& logEntry = getCANLogAt(i);
+      uint32_t pos = parsePos(logEntry.data);
       html += "N";
-      html += String(canLogs[i].id, HEX);
+      html += String(logEntry.id, HEX);
       html += " Pos:";
       html += String(pos);
       html += " T:";
-      html += String(canLogs[i].timestamp);
-      html += "<br>";
+      html += String(logEntry.timestamp);
+      html += "\n";
     }
-    server.send(200, "text/html", html);
+    server.send(200, "text/plain", html);
   });
 
   server.begin();
@@ -598,11 +1020,15 @@ void setupWebServer() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
+
   Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║ Dual MD89MW-CAN Servo Controller       ║");
-  Serial.println("║ 500kbps | Touchscreen UI               ║");
+  Serial.println("║ 500kbps | Touch Select + START Button  ║");
   Serial.println("╚════════════════════════════════════════╝\n");
+
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
+  lastStartButtonReading = digitalRead(START_BUTTON_PIN);
+  startButtonStableState = lastStartButtonReading;
 
   SPI.end();
   delay(10);
@@ -617,7 +1043,9 @@ void setup() {
 
   if (!initCAN_500kbps()) {
     Serial.println("[FATAL] CAN initialization failed!");
-    while(1) delay(1000);
+    while (1) {
+      delay(1000);
+    }
   }
 
   WiFi.softAP("ESP32-S3-CAN", "password123");
@@ -625,67 +1053,29 @@ void setup() {
   Serial.println(WiFi.softAPIP());
 
   setupWebServer();
-  Serial.println("[HTTP] Ready\n");
+  Serial.println("[HTTP] Ready");
+  Serial.println("[UI] Touch S1/S2, press START button to toggle motion\n");
+
+  markDisplayDirty(DIRTY_ALL);
+  updateDisplay();
 }
 
 // ========== MAIN LOOP ==========
 void loop() {
   server.handleClient();
   handleTouch();
+  handleStartButton();
 
-  // Process Servo 1
-  if (servo1.active) {
-    moveSmooth(CENTER_POS, RIGHT_POS, NODE_ID_SERVO1, true);
-    if (servo1.active) {
-      Serial.println("\n=== Servo 1: Pause at END ===");
-      delay(1000);
-    }
-    if (servo1.active) {
-      moveSmooth(RIGHT_POS, CENTER_POS, NODE_ID_SERVO1, false);
-      if (servo1.active) {
-        Serial.println("\n=== Servo 1: Pause at START ===");
-        delay(1000);
-      }
-    }
-  }
+  processCANReceive(0);
+  refreshServoLinkState();
 
-  // Process Servo 2
-  if (servo2.active) {
-    moveSmooth(CENTER_POS, LEFT_POS, NODE_ID_SERVO2, true);
-    if (servo2.active) {
-      Serial.println("\n=== Servo 2: Pause at END ===");
-      delay(1000);
-    }
-    if (servo2.active) {
-      moveSmooth(LEFT_POS, CENTER_POS, NODE_ID_SERVO2, false);
-      if (servo2.active) {
-        Serial.println("\n=== Servo 2: Pause at START ===");
-        delay(1000);
-      }
-    }
-  }
+  serviceServoMotion(1);
+  serviceServoMotion(2);
 
-  // Continuous CAN reception
-  twai_message_t rx = {0};
-  if (twai_receive(&rx, pdMS_TO_TICKS(0)) == ESP_OK) {
-    if ((rx.identifier == NODE_ID_SERVO1 || rx.identifier == NODE_ID_SERVO2) && 
-        rx.data_length_code >= 8) {
-      ServoState& servo = (rx.identifier == NODE_ID_SERVO1) ? servo1 : servo2;
-      servo.currentPos = parsePos(rx.data);
-      servo.responding = true;
-      
-      CANMessage msg;
-      msg.id = rx.identifier;
-      msg.dlc = rx.data_length_code;
-      msg.timestamp = millis();
-      for (int i = 0; i < 8; i++) msg.data[i] = rx.data[i];
-      if (logCount < 50) canLogs[logCount++] = msg;
-      
-      printCAN("RX", rx.identifier, rx);
-    }
-  }
+  processCANReceive(0);
+  refreshServoLinkState();
 
-  if (millis() - lastTftUpdate >= 100) {
+  if (millis() - lastTftUpdate >= TFT_UPDATE_INTERVAL_MS) {
     updateDisplay();
     lastTftUpdate = millis();
   }
