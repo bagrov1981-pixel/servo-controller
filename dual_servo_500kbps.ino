@@ -69,6 +69,7 @@ const unsigned long LINK_STALE_MS = 1000;
 const unsigned long TFT_UPDATE_INTERVAL_MS = 50;
 const int MAX_CAN_LOGS = 50;
 const int TFT_LOG_LINES = 6;
+const float MOTION_CURVE_PI = 3.14159265f;
 
 // ========== DATA STRUCTURES ==========
 struct CANMessage {
@@ -451,6 +452,7 @@ void serviceServoMotion(int servoNum) {
     } else if ((now - servo.probeStartedAt) >= START_PROBE_TIMEOUT_MS) {
       servo.starting = false;
       servo.active = false;
+      servo.linkHealthy = false;
       Serial.print("[ERROR] NO RESPONSE from Servo ");
       Serial.println(servoNum);
       markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
@@ -480,7 +482,7 @@ void serviceServoMotion(int servoNum) {
   }
 
   float progress = (float)stepToSend / (float)TOTAL_STEPS;
-  float curve = (1.0f - cosf(progress * PI)) * 0.5f;
+  float curve = (1.0f - cosf(progress * MOTION_CURVE_PI)) * 0.5f;
   uint32_t target = startPos + (int32_t)(distance * curve);
 
   servo.commandedPos = target;
@@ -773,8 +775,8 @@ void handleTouch() {
   TS_Point p = ts.getPoint();
   SPI.endTransaction();
 
-  int x = map(p.x, 3703, 463, 0, SCREEN_W);
-  int y = map(p.y, 3110, 528, 0, SCREEN_H);
+  int x = map(p.x, 3703, 463, 0, SCREEN_W - 1);
+  int y = map(p.y, 3110, 528, 0, SCREEN_H - 1);
 
   Serial.print("[TOUCH] X:");
   Serial.print(x);
