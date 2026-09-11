@@ -436,8 +436,11 @@ void stopServoMotion(int servoNum) {
 
   servo.active = false;
   servo.starting = false;
+  servo.responding = false;
+  servo.linkHealthy = false;
   servo.stepIndex = 0;
   servo.pauseUntil = 0;
+  servo.lastResponseAt = 0;
   servo.probeStartedAt = 0;
   servo.commandedPos = servo.currentPos;
   markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
@@ -471,7 +474,9 @@ void serviceServoMotion(int servoNum) {
     } else if ((now - servo.probeStartedAt) >= START_PROBE_TIMEOUT_MS) {
       servo.starting = false;
       servo.active = false;
+      servo.responding = false;
       servo.linkHealthy = false;
+      servo.lastResponseAt = 0;
       Serial.print("[ERROR] NO RESPONSE from Servo ");
       Serial.println(servoNum);
       markDisplayDirty(DIRTY_SELECTED | DIRTY_BUTTONS);
