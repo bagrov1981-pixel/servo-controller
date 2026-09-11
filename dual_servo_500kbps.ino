@@ -65,7 +65,7 @@ const unsigned long MOTION_PAUSE_MS = 1000;
 const unsigned long START_PROBE_TIMEOUT_MS = 1500;
 const unsigned long TOUCH_DEBOUNCE_MS = 250;
 const unsigned long START_DEBOUNCE_MS = 40;
-const unsigned long LINK_STALE_MS = 1000;
+const unsigned long LINK_STALE_MS = 2500;
 const unsigned long TFT_UPDATE_INTERVAL_MS = 50;
 const int MAX_CAN_LOGS = 50;
 const int TFT_LOG_LINES = 6;
@@ -876,12 +876,16 @@ const char index_html[] PROGMEM = R"rawliteral(
     <script>
         setInterval(() => {
             fetch('/status').then(r => r.json()).then(d => {
-                document.getElementById('status1').textContent = d.s1_active ? 'ACTIVE' : 'IDLE';
+                document.getElementById('status1').textContent =
+                    (d.s1_starting ? 'STARTING' : (d.s1_active ? 'ACTIVE' : 'IDLE')) +
+                    (d.s1_link ? ' / CAN OK' : ' / WAIT');
                 document.getElementById('pos1').textContent = d.s1_pos;
                 document.getElementById('cmd1').textContent = d.s1_cmd;
                 document.getElementById('lag1').textContent = d.s1_lag;
 
-                document.getElementById('status2').textContent = d.s2_active ? 'ACTIVE' : 'IDLE';
+                document.getElementById('status2').textContent =
+                    (d.s2_starting ? 'STARTING' : (d.s2_active ? 'ACTIVE' : 'IDLE')) +
+                    (d.s2_link ? ' / CAN OK' : ' / WAIT');
                 document.getElementById('pos2').textContent = d.s2_pos;
                 document.getElementById('cmd2').textContent = d.s2_cmd;
                 document.getElementById('lag2').textContent = d.s2_lag;
@@ -908,10 +912,14 @@ void setupWebServer() {
     String json = "{";
     json += "\"selected\":" + String(selectedServo);
     json += ",\"s1_active\":" + String(servo1.active ? "true" : "false");
+    json += ",\"s1_starting\":" + String(servo1.starting ? "true" : "false");
+    json += ",\"s1_link\":" + String(servo1.linkHealthy ? "true" : "false");
     json += ",\"s1_pos\":" + String(servo1.currentPos);
     json += ",\"s1_cmd\":" + String(servo1.commandedPos);
     json += ",\"s1_lag\":" + String(servoLag(servo1));
     json += ",\"s2_active\":" + String(servo2.active ? "true" : "false");
+    json += ",\"s2_starting\":" + String(servo2.starting ? "true" : "false");
+    json += ",\"s2_link\":" + String(servo2.linkHealthy ? "true" : "false");
     json += ",\"s2_pos\":" + String(servo2.currentPos);
     json += ",\"s2_cmd\":" + String(servo2.commandedPos);
     json += ",\"s2_lag\":" + String(servoLag(servo2));
